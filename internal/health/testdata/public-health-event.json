@@ -1,0 +1,46 @@
+{
+  "version": "0",
+  "id": "7bf73129-1428-4cd3-a780-95db273d1602",
+  "detail-type": "AWS Health Event",
+  "source": "aws.health",
+  "account": "123456789012",
+  "time": "2023-01-27T09:01:22Z",
+  "region": "us-east-1",
+  "resources": [],
+  "detail": {
+    "eventArn": "arn:aws:health:af-south-1::event/EC2/AWS_EC2_OPERATIONAL_ISSUE/AWS_EC2_OPERATIONAL_ISSUE_example",
+    "service": "EC2",
+    "eventTypeCode": "AWS_EC2_OPERATIONAL_ISSUE",
+    "eventTypeCategory": "issue",
+    "eventScopeCode": "PUBLIC",
+    "communicationId": "01b0993207d81a09dcd552ebd1e633e36cf1f09a-1",
+    "startTime": "Fri, 27 Jan 2023 06:02:51 GMT",
+    "endTime": "Fri, 27 Jan 2023 09:01:22 GMT",
+    "lastUpdatedTime": "Fri, 27 Jan 2023 09:01:22 GMT",
+    "statusCode": "closed",
+    "eventRegion": "af-south-1",
+    "eventDescription": [
+      {
+        "language": "fr_FR",
+        "latestDescription": "Description de secours"
+      },
+      {
+        "language": "en_US",
+        "latestDescription": "[RESOLVED]\nThe service has recovered."
+      }
+    ],
+    "affectedEntities": [
+      {
+        "entityValue": "i-0123456789abcdef0",
+        "lastUpdatedTime": "Fri, 27 Jan 2023 09:01:22 GMT",
+        "status": "RESOLVED"
+      }
+    ],
+    "page": "1",
+    "totalPages": "1",
+    "backupEvent": "false",
+    "affectedAccount": "210987654321",
+    "actionability": "INFORMATIONAL",
+    "personas": ["OPERATIONS"]
+  }
+}
