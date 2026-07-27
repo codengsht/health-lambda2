@@ -1,0 +1,36 @@
+# GoReleaser configuration for the AWS Health Event Forwarder Lambda.
+# Produces exactly one Release_Bundle: dist/aws-health-event-forwarder.zip
+# containing a single `bootstrap` executable at the archive root, as required by
+# the provided.al2 / provided.al2023 custom runtimes.
+version: 2
+
+project_name: aws-health-event-forwarder
+
+builds:
+  - id: forwarder
+    main: .
+    binary: bootstrap
+    goos:
+      - linux
+    goarch:
+      - amd64
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w
+
+archives:
+  - id: lambda
+    formats:
+      - zip
+    # bootstrap must sit at the archive root, and the archive must hold nothing
+    # else, so no wrapping directory and no extra `files` entries.
+    wrap_in_directory: false
+    name_template: "{{ .ProjectName }}"
+    # GoReleaser otherwise adds README*/LICENSE*/CHANGELOG* by default; the
+    # glob below matches nothing, leaving `bootstrap` as the only entry.
+    files:
+      - none*
+
+changelog:
+  disable: true

@@ -1,0 +1,6 @@
+# GoReleaser output (Release_Bundle and intermediate build artifacts)
+dist/
+
+# Locally compiled binaries
+/aws-health-event-forwarder
+/bootstrap

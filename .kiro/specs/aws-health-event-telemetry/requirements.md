@@ -2,286 +2,158 @@
 
 ## Introduction
 
-This feature is a Go (Golang) AWS Lambda function that receives AWS Health events delivered from Amazon EventBridge and emits observability telemetry to Datadog. Telemetry is submitted through the Datadog Lambda Go v2 library (DDLambda_Library) and forwarded by the Datadog Lambda Extension. A downstream Datadog dashboard consumes this telemetry to provide organization-wide awareness of public AWS service outage candidates involving the organization's safe-landed services and Regions.
+The AWS Health Event Forwarder is a Go AWS Lambda function that receives AWS Health events delivered by EventBridge and submits Datadog custom metrics. This spec makes the function production-ready by fixing an outage-duration inflation defect and narrowing the function to a single, joinable metric.
 
-The Lambda's sole responsibility is to process every AWS Health event it receives and emit telemetry derived from that event. It performs no filtering, no state persistence, and no deduplication. All event filtering (Region, safe-landed services, FIS events) is performed by the EventBridge rule before the event reaches the Lambda. Downstream consumers correlate and consolidate on `eventArn` (plus `communicationId` for exact-delivery deduplication).
+EventBridge redelivers the same AWS Health event multiple times across its lifecycle. The previous `aws.health.issue.duration_seconds` metric was a Datadog distribution with no per-outage identity tag, so duplicate deliveries of the same resolved event were indistinguishable from two genuine outages of equal length. A dashboard widget that summed the metric therefore inflated total outage time (an observed `multiple_services` total of 10,325 seconds). No query-only correction is possible: collapsing duplicates requires a stable per-outage identity tag on the metric itself, and the function must remain stateless (no database, no cache).
 
-A critical constraint: Lambda application logs are not available in Datadog for compliance reasons. Therefore the dashboard-required dimensions and the downstream correlation identifiers that must be visible downstream are carried in the metric tags themselves. The metric tags do not carry the complete AWS Health event; fields that are free-text, high-cardinality, timestamp-based, or effectively constant are deliberately not emitted as tags (see "AWS Health event fields deliberately not emitted as metric tags"), and the complete original event is preserved only in the initial raw-event log record, which is not sent to Datadog. All metric tag values are additionally subject to Datadog tag normalization, including case-folding, character replacement, and a 200-character cap, so no tag value is guaranteed to be retained without modification or truncation.
+As prior context, a change that shipped before this spec already added the event ARN as a per-outage identity tag (`event_arn`) on the duration metric, because the ARN is stable across every lifecycle delivery of the same health event, unlike `communicationId`, which changes on each delivery. That tag exists in the current code and is not work this spec introduces.
 
-Metric submission is best-effort. Parsing and validation failures remain fail-closed and are returned as non-nil handler errors so that asynchronous retry and the DLQ can handle them, but a locally-detectable metric submission error alone does not fail the invocation: the Health_Telemetry_Lambda logs the condition and continues. As a consequence, if the Datadog Lambda Extension is unhealthy, individual telemetry data points may be silently lost rather than retried through the DLQ; this tradeoff is accepted because the Alert Status Metric represents observed state rather than a guaranteed count and the event volume is low.
+This spec makes five changes on top of that baseline. First, the metric is renamed to `aws.health.events.duration`. Second, the `event_arn` tag key is renamed to `arn` and its value is emitted in full and untrimmed by removing the trimming helper, so metric series join byte-for-byte against native Datadog AWS Health events, which carry the full ARN. Third, the `received` and `alert_status` metrics are dropped, because the native Datadog AWS Health integration (already enabled in the `aws_is0001_prod` account) supplies event identity, lifecycle, and counts. Fourth, unprocessable payloads are routed to the DLQ instead of being silently skipped. Fifth, the query-time dedup pattern is documented, because deduplication remains a query-time concern and the function stays stateless. The native integration ingests Datadog Events only and cannot compute a duration: AWS Health start and end times are RFC2822 strings, Datadog tag values are strings, and the query layer offers no date parsing or per-row time arithmetic. The Lambda-computed duration is therefore the irreplaceable value this function provides.
 
-The `event_arn` tag carries the substring of the detail `eventArn` that follows the first occurrence of the marker `event/`, so that the tag value stays within the Datadog 200-character normalized tag limit. The complete original `eventArn` value is preserved only in the initial raw-event log record, which is not sent to Datadog.
+The Forwarder emits output only for resolved events. It produces a metric sample only when `detail.statusCode` is `closed`; every other lifecycle delivery (open, upcoming, or any other status) is logged and the invocation ends successfully with no metric sample and no DLQ routing.
 
-The AWS Health EventBridge schema referenced by this document is the published schema at [Reference: AWS Health events Amazon EventBridge schema](https://docs.aws.amazon.com/health/latest/ug/aws-health-events-eventbridge-schema.html). Field mandatory/optional designations in this document are derived from that reference. (Content was rephrased for compliance with licensing restrictions.)
-
-## Glossary
-
-- **Health_Telemetry_Lambda**: The Go AWS Lambda function that is the subject of this specification. It receives one AWS Health event per invocation, logs it, validates it, and emits telemetry.
-- **EventBridge Envelope**: The outer JSON object delivered to the Lambda by EventBridge, containing the fields `version`, `id`, `detail-type`, `source`, `account`, `time`, `region`, `resources`, and `detail`.
-- **AWS Health Detail**: The object contained in the envelope `detail` field, describing the AWS Health event (for example `eventArn`, `service`, `statusCode`, `startTime`, `endTime`).
-- **Envelope_Parser**: The component of the Health_Telemetry_Lambda responsible for deserializing the EventBridge Envelope from raw input.
-- **Detail_Parser**: The component of the Health_Telemetry_Lambda responsible for deserializing the AWS Health Detail from the envelope `detail` field.
-- **Field_Validator**: The component of the Health_Telemetry_Lambda responsible for validating required fields of the EventBridge Envelope and AWS Health Detail.
-- **Duration_Calculator**: The component of the Health_Telemetry_Lambda responsible for computing the outage duration in seconds for a Closed Event.
-- **Metric_Emitter**: The component of the Health_Telemetry_Lambda responsible for submitting custom metrics to Datadog.
-- **Event_Logger**: The component of the Health_Telemetry_Lambda responsible for writing the initial raw-event log record.
-- **Result_Logger**: The component of the Health_Telemetry_Lambda responsible for writing the normalized structured success log record.
-- **Received Metric**: The custom metric named `aws_health.issue.received`.
-- **Alert Status Metric**: The custom metric named `aws_health.issue.alert_status`, submitted through the DDLambda_Library as a distribution and interpreted downstream as observed state (via the per-series `max` or the latest point per series), NOT a true gauge.
-- **Duration Metric**: The custom metric named `aws_health.issue.duration_seconds`.
-- **Datadog Lambda Extension**: The Datadog agent process running locally within the Lambda execution environment that receives metrics submitted via the DDLambda_Library and forwards telemetry to Datadog.
-- **DDLambda_Library**: The Datadog Lambda Go v2 package `github.com/DataDog/dd-trace-go/contrib/aws/datadog-lambda-go/v2` (verified latest v2.9.1 at time of writing; the exact version is to be reconfirmed before implementation).
-- **Closed Event**: An AWS Health Detail whose `statusCode` value equals `closed`.
-- **Open Event**: An AWS Health Detail whose `statusCode` value equals `open`.
-- **Upcoming Event**: An AWS Health Detail whose `statusCode` value equals `upcoming`.
-- **Failure Category**: One of the defined categorization labels that cause the Health_Telemetry_Lambda to fail with a non-nil handler error: `envelope_json_parse_failure`, `envelope_validation_failure`, `detail_json_parse_failure`, `detail_validation_failure`, `required_timestamp_failure`, and `unexpected_internal_failure`.
-- **Log Annotation**: An internal categorization label recorded in a log record for a best-effort condition that does NOT fail the invocation. The only defined Log Annotation is `metric_submission_failure` (a locally-detectable metric submission error). A Log Annotation is not a Failure Category and never causes the Health_Telemetry_Lambda to return a non-nil error.
-- **Event Arn Tag Value**: The value assigned to the `event_arn` tag, derived from the detail `eventArn` as the substring that follows the first occurrence of the literal marker `event/`. WHERE the detail `eventArn` does not contain the marker `event/`, the Event Arn Tag Value is the full detail `eventArn` value. IF the resulting value would exceed the Datadog 200-character normalized tag limit, the value is truncated from the end, retaining the leading characters, to fit within that limit as a last-resort safety measure.
-- **Datadog Tag Normalization**: The set of transformations Datadog applies to every metric tag value, including case-folding to lowercase, replacement of characters that are not permitted in tag values, and enforcement of a 200-character cap. All metric tag values emitted by the Health_Telemetry_Lambda are subject to Datadog Tag Normalization; consequently no tag value can be guaranteed to be retained without modification or truncation. The Event Arn Tag Value is the field most likely to approach the 200-character cap, which is the reason the Event Arn Tag Value extraction logic exists; the other tag values (for example `affected_account`, `communication_id`, and `page`) are expected to be well within the cap but remain subject to the same normalization.
-- **Receiving Account**: The account ID in the envelope `account` field, which is the account to which the AWS Health event was delivered.
-- **Affected Account**: The account ID in the detail `affectedAccount` field, which is the account impacted by the AWS Health event.
-- **Detail Timestamp**: A timestamp field within the AWS Health Detail (`startTime`, `endTime`, `lastUpdatedTime`) formatted in the AWS Health day-of-week style, for example `Fri, 27 Jan 2023 06:02:51 GMT`.
-- **Safe-Landed Service**: An AWS service that the organization has enabled and tracks (per go/awsserviceenablement). Filtering to Safe-Landed Services is performed by the EventBridge rule and is out of scope for the Health_Telemetry_Lambda.
-
-## Requirements
-
-### Requirement 1: Accept and immediately log every received event
-
-**User Story:** As an operations engineer, I want every incoming AWS Health event to be logged verbatim before any processing, so that I can audit exactly what was delivered even when the payload is malformed.
-
-#### Acceptance Criteria
-
-1. WHEN the Health_Telemetry_Lambda is invoked with an input payload, THE Event_Logger SHALL write a single-line JSON log record before any component reads, parses, or transforms the payload.
-2. WHEN the input payload is valid JSON, THE Event_Logger SHALL write a log record of the form `{"record_type":"aws_health_event_received","event":{...original event...}}` where the `event` value reproduces the original parsed JSON payload verbatim, without truncation or modification.
-3. IF the input payload is absent, null, empty, or not valid JSON, THEN THE Event_Logger SHALL write a log record of the form `{"record_type":"aws_health_event_received","raw_event":"...escaped input..."}` where the `raw_event` value is the original input rendered as a string with any characters not valid within a JSON string escaped.
-4. THE Event_Logger SHALL write the initial log record containing no embedded newline or carriage-return characters, escaping any such characters that appear in the payload.
-5. THE Health_Telemetry_Lambda SHALL accept every AWS Health event delivered to it without applying any filtering, sampling, or selection criterion.
-6. IF the Event_Logger cannot write the initial raw-event log record, THEN THE Health_Telemetry_Lambda SHALL continue processing the event, including parsing, validation, and metric emission, AND SHALL NOT fail the invocation on account of the initial log-write failure.
-
-### Requirement 2: Parse the EventBridge envelope
-
-**User Story:** As a developer, I want the Lambda to deserialize the EventBridge envelope reliably, so that the embedded AWS Health detail and delivery metadata can be extracted.
-
-#### Acceptance Criteria
-
-1. WHEN the initial log record has been written, THE Envelope_Parser SHALL attempt, exactly once, to deserialize the input payload into an EventBridge Envelope structure, ignoring any top-level fields other than `version`, `id`, `detail-type`, `source`, `account`, `time`, `region`, `resources`, and `detail`.
-2. IF the input payload is not valid JSON, or is valid JSON that is not a JSON object, THEN THE Envelope_Parser SHALL stop envelope processing without extracting any envelope field AND SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `envelope_json_parse_failure`.
-3. WHEN the input payload has been deserialized as a JSON object, THE Envelope_Parser SHALL extract each of the fields `version`, `id`, `detail-type`, `source`, `account`, `time`, `region`, `resources`, and `detail` that is present, SHALL retain the `detail` field as a raw JSON value without deserializing its contents, and SHALL preserve any absent field as absent for subsequent validation without causing a failure.
-
-### Requirement 3: Validate the EventBridge envelope
-
-**User Story:** As an operations engineer, I want the envelope required fields validated, so that only well-formed deliveries produce telemetry and receiving-account and delivery-region metadata are trustworthy.
-
-#### Acceptance Criteria
-
-1. THE Field_Validator SHALL treat the envelope fields `version`, `id`, `detail-type`, `source`, `account`, `time`, and `region` as required JSON string fields, and the envelope field `detail` as a required JSON object field.
-2. IF a required envelope field is absent, THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `envelope_validation_failure`.
-3. IF a required envelope field is present but is not of its expected JSON type (each of `version`, `id`, `detail-type`, `source`, `account`, `time`, and `region` as a JSON string, and `detail` as a JSON object), THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `envelope_validation_failure`.
-4. IF a required envelope string field is present but contains zero characters or only whitespace characters, THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `envelope_validation_failure`.
-5. IF the envelope `account` field is not a twelve-digit numeric string, THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `envelope_validation_failure`.
-6. WHEN the envelope `resources` field is absent or empty, THE Field_Validator SHALL treat the EventBridge Envelope as valid with respect to the `resources` field.
-7. IF the envelope `time` field is present but cannot be parsed as an RFC 3339 timestamp, THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `required_timestamp_failure`.
-
-### Requirement 4: Parse the AWS Health detail
-
-**User Story:** As a developer, I want the embedded AWS Health detail deserialized, so that the event fields can be validated and captured as telemetry tags.
-
-#### Acceptance Criteria
-
-1. WHEN the EventBridge Envelope has passed all required validation, THE Detail_Parser SHALL deserialize the envelope `detail` field into an AWS Health Detail structure.
-2. IF the envelope `detail` field cannot be deserialized as a JSON object, THEN THE Detail_Parser SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `detail_json_parse_failure`.
-3. WHEN the AWS Health Detail is deserialized, THE Detail_Parser SHALL extract the fields `eventArn`, `service`, `eventTypeCode`, `eventTypeCategory`, `eventScopeCode`, `communicationId`, `startTime`, `endTime`, `lastUpdatedTime`, `statusCode`, `eventRegion`, `eventDescription`, `page`, `totalPages`, `backupEvent`, `affectedAccount`, `actionability`, `personas`, `eventMetadata`, and `affectedEntities` into the AWS Health Detail structure.
-4. WHEN a field listed in acceptance criterion 3 is absent from the deserialized JSON object, THE Detail_Parser SHALL capture that field as an unset value without causing a deserialization failure, and SHALL defer presence and type checking to the Field_Validator.
-5. IF the Detail_Parser causes the Health_Telemetry_Lambda to fail with Failure Category `detail_json_parse_failure`, THEN THE Health_Telemetry_Lambda SHALL NOT submit any telemetry for the event.
-
-### Requirement 5: Validate required AWS Health detail fields
-
-**User Story:** As an operations engineer, I want the required AWS Health detail fields rigorously validated, so that emitted telemetry is complete and enum-based tags are trustworthy.
-
-#### Acceptance Criteria
-
-1. THE Field_Validator SHALL treat the detail fields `eventArn`, `service`, `eventTypeCode`, `eventTypeCategory`, `eventScopeCode`, `communicationId`, `startTime`, `lastUpdatedTime`, `statusCode`, `eventRegion`, `eventDescription`, `page`, `totalPages`, `backupEvent`, and `affectedAccount` as required.
-2. IF a required detail field is absent, THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `detail_validation_failure`.
-3. IF a required detail field is present but is not of its expected JSON type, THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `detail_validation_failure`.
-4. IF a required detail string field is present but contains zero characters or only whitespace characters, THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `detail_validation_failure`.
-5. IF the detail `statusCode` value is not an exact, case-sensitive match to one of `open`, `closed`, or `upcoming`, THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `detail_validation_failure`.
-6. IF the detail `eventScopeCode` value is not an exact, case-sensitive match to one of `PUBLIC` or `ACCOUNT_SPECIFIC`, THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `detail_validation_failure`.
-7. IF the detail `eventTypeCategory` value is not an exact, case-sensitive match to one of `issue`, `accountNotification`, `investigation`, or `scheduledChange`, THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `detail_validation_failure`.
-8. IF the detail `affectedAccount` field is not a string of exactly twelve characters where each character is a decimal digit `0` through `9`, THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `detail_validation_failure`.
-9. IF the detail `page` value cannot be parsed as an integer greater than or equal to `1`, THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `detail_validation_failure`.
-10. IF the detail `totalPages` value cannot be parsed as an integer greater than or equal to `1`, THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `detail_validation_failure`.
-11. IF the parsed detail `page` value is greater than the parsed detail `totalPages` value, THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `detail_validation_failure`.
-12. IF the detail `eventDescription` collection is absent or empty, THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `detail_validation_failure`.
-13. IF any element of the detail `eventDescription` collection is not an object carrying a non-empty descriptive text value, THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `detail_validation_failure`.
-14. IF the detail `startTime` value cannot be parsed as a Detail Timestamp, THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `required_timestamp_failure`.
-15. IF the detail `lastUpdatedTime` value cannot be parsed as a Detail Timestamp, THEN THE Field_Validator SHALL cause the Health_Telemetry_Lambda to fail with Failure Category `required_timestamp_failure`.
-
-### Requirement 6: Tolerantly decode optional AWS Health detail fields
-
-**User Story:** As an operations engineer, I want optional fields decoded leniently, so that a valid event still produces telemetry even when optional metadata is malformed or missing.
-
-#### Acceptance Criteria
-
-1. THE Field_Validator SHALL treat the detail fields `endTime`, `eventMetadata`, `affectedEntities`, `actionability`, and `personas` as optional.
-2. IF an optional detail field is absent, THEN THE Detail_Parser SHALL treat the AWS Health Detail as valid with respect to that field and SHALL omit that field's value from downstream use.
-3. IF an optional detail field is present but cannot be decoded into its expected JSON type, THEN THE Detail_Parser SHALL treat the AWS Health Detail as valid with respect to that field and SHALL omit that field's value from downstream use.
-4. WHEN an optional detail field is present and can be decoded into its expected JSON type, THE Detail_Parser SHALL retain that field's decoded value for downstream use.
-5. IF an optional detail field is absent or cannot be decoded into its expected JSON type, THEN THE Detail_Parser SHALL NOT cause the Health_Telemetry_Lambda to fail and SHALL NOT assign any Failure Category on account of that field.
-6. WHEN the detail `endTime` field is absent or cannot be parsed as a Detail Timestamp, THE Duration_Calculator SHALL treat the outage duration as unavailable.
-
-### Requirement 7: Emit the received metric
-
-**User Story:** As a dashboard consumer, I want a metric emitted once per successfully validated event delivery, so that I can count events and updates and break them down by service, Region, and status.
-
-#### Acceptance Criteria
-
-1. WHEN the EventBridge Envelope and AWS Health Detail have passed all required validation, THE Metric_Emitter SHALL submit the Received Metric `aws_health.issue.received` with a numeric value of `1`.
-2. THE Metric_Emitter SHALL make exactly one submission attempt for the Received Metric per handler invocation attempt for an event that has passed validation.
-3. THE Metric_Emitter SHALL submit the Received Metric through the DDLambda_Library global `Metric` helper.
-4. Because the DDLambda_Library `Metric` helper returns no value and is fire-and-forget (the Received Metric sample is buffered and flushed asynchronously by the Datadog Lambda Extension), THE Metric_Emitter SHALL make a single best-effort submission call for the Received Metric and SHALL NOT attempt to observe its delivery success or failure; IF a locally-detectable error occurs while making that submission call (for example a runtime error or panic during the call), THEN THE Metric_Emitter SHALL write a log record carrying the internal `metric_submission_failure` Log Annotation AND THE Health_Telemetry_Lambda SHALL continue without returning a non-nil error on account of that error.
-5. IF the EventBridge Envelope and AWS Health Detail have not both passed all required validation, THEN THE Metric_Emitter SHALL NOT submit the Received Metric.
-
-### Requirement 8: Emit the alert status metric
-
-**User Story:** As a dashboard consumer, I want a status metric that reflects whether an event is currently open, interpreted as observed state, so that I can display active outage candidates without series fragmentation.
-
-#### Acceptance Criteria
-
-1. WHEN the EventBridge Envelope and the AWS Health Detail have passed all required validation, THE Metric_Emitter SHALL submit the Alert Status Metric `aws_health.issue.alert_status` through the DDLambda_Library global `Metric` helper as a distribution, making exactly one submission attempt for the Alert Status Metric per handler invocation attempt for an event that has passed validation.
-2. WHILE the AWS Health Detail is an Open Event, THE Metric_Emitter SHALL submit the Alert Status Metric with a value of `1`.
-3. WHILE the AWS Health Detail is a Closed Event or an Upcoming Event, THE Metric_Emitter SHALL submit the Alert Status Metric with a value of `0`.
-4. THE Metric_Emitter SHALL submit the Alert Status Metric with a value of either `0` or `1` and no other value.
-5. THE Metric_Emitter SHALL submit the Alert Status Metric through the DDLambda_Library global `Metric` helper, the same channel used for the Received Metric and the Duration Metric.
-6. Because the DDLambda_Library `Metric` helper returns no value and is fire-and-forget (the Alert Status Metric sample is buffered and flushed asynchronously by the Datadog Lambda Extension), THE Metric_Emitter SHALL make a single best-effort submission call for the Alert Status Metric and SHALL NOT attempt to observe its delivery success or failure; IF a locally-detectable error occurs while making that submission call (for example a runtime error or panic during the call), THEN THE Metric_Emitter SHALL write a log record carrying the internal `metric_submission_failure` Log Annotation AND THE Health_Telemetry_Lambda SHALL continue without returning a non-nil error on account of that error.
-7. THE Alert Status Metric SHALL represent the last status observed for a given outage series (last-write-wins per series), and SHALL NOT be treated as an authoritative guarantee of the current real-world state; the value MAY be stale or briefly out of order if EventBridge delivers lifecycle updates out of sequence, and downstream consumers SHALL treat the value as observed state; because the Alert Status Metric is distribution-backed rather than a true gauge, downstream consumers SHALL query it as the per-series `max` or the latest point per series.
-
-### Requirement 9: Compute and emit the duration metric
-
-**User Story:** As a dashboard consumer, I want the outage duration emitted for resolved events, so that I can report how long each service was impacted over a time window.
-
-#### Acceptance Criteria
-
-1. WHILE the AWS Health Detail is a Closed Event AND the detail `startTime` and `endTime` are both parseable Detail Timestamps AND the parsed `endTime` is greater than or equal to the parsed `startTime`, THE Duration_Calculator SHALL compute the outage duration as the non-negative integer number of whole seconds between the parsed `startTime` and the parsed `endTime`.
-2. WHEN the outage duration has been computed, THE Metric_Emitter SHALL make exactly one submission attempt for the Duration Metric `aws_health.issue.duration_seconds` with the computed duration value in seconds per handler invocation attempt.
-3. IF the AWS Health Detail is not a Closed Event, THEN THE Metric_Emitter SHALL omit submission of the Duration Metric.
-4. IF the detail `endTime` is absent or is not a parseable Detail Timestamp, THEN THE Metric_Emitter SHALL omit submission of the Duration Metric.
-5. IF the parsed `endTime` is earlier than the parsed `startTime`, THEN THE Metric_Emitter SHALL omit submission of the Duration Metric.
-6. THE Metric_Emitter SHALL submit the Duration Metric through the DDLambda_Library global `Metric` helper.
-7. Because the DDLambda_Library `Metric` helper returns no value and is fire-and-forget (the Duration Metric sample is buffered and flushed asynchronously by the Datadog Lambda Extension), THE Metric_Emitter SHALL make a single best-effort submission call for the Duration Metric and SHALL NOT attempt to observe its delivery success or failure; IF a locally-detectable error occurs while making that submission call (for example a runtime error or panic during the call), THEN THE Metric_Emitter SHALL write a log record carrying the internal `metric_submission_failure` Log Annotation AND THE Health_Telemetry_Lambda SHALL continue without returning a non-nil error on account of that error.
-8. IF the AWS Health Detail is a Closed Event AND the detail `startTime` is absent or is not a parseable Detail Timestamp, THEN THE Metric_Emitter SHALL omit submission of the Duration Metric.
-
-### Requirement 10: Tag the received and duration metrics
-
-**User Story:** As a dashboard consumer, I want the dashboard-required dimensions and downstream correlation identifiers carried in metric tags, so that I can query and inspect outages without access to Lambda logs.
-
-#### Acceptance Criteria
-
-1. WHEN submitting the Received Metric and the Duration Metric, THE Metric_Emitter SHALL attach the tags `event_arn`, `communication_id`, `affected_account`, `receiving_account`, `aws_service`, `affected_region`, `delivery_region`, `event_type_code`, `event_type_category`, `event_scope_code`, `status_code`, `page`, `total_pages`, `backup_event`, `actionability`, `persona`, and `duration_available`.
-2. THE Metric_Emitter SHALL set the tag values from the corresponding fields as follows: `event_arn` to the Event Arn Tag Value derived from detail `eventArn`; `communication_id` from detail `communicationId`; `affected_account` from detail `affectedAccount`; `receiving_account` from envelope `account`; `aws_service` from detail `service`; `affected_region` from detail `eventRegion`; `delivery_region` from envelope `region`; `event_type_code` from detail `eventTypeCode`; `event_type_category` from detail `eventTypeCategory`; `event_scope_code` from detail `eventScopeCode`; `status_code` from detail `statusCode`; `page` from detail `page`; `total_pages` from detail `totalPages`; `backup_event` from detail `backupEvent`.
-3. THE Metric_Emitter SHALL set the `event_arn` tag to the Event Arn Tag Value, which is the substring of the detail `eventArn` that follows the first occurrence of the literal marker `event/`; WHERE the detail `eventArn` does not contain the marker `event/`, THE Metric_Emitter SHALL set the `event_arn` tag to the full detail `eventArn` value; IF the resulting `event_arn` tag value would exceed the Datadog 200-character normalized tag limit, THEN THE Metric_Emitter SHALL truncate the value from the end, retaining the leading characters, to fit within that limit as a last-resort safety measure.
-4. WHERE the detail `actionability` field is present and decodable, THE Metric_Emitter SHALL set the `actionability` tag to its value.
-5. WHERE the detail `actionability` field is absent or not decodable, THE Metric_Emitter SHALL set the `actionability` tag to the literal value `unknown`.
-6. WHERE the detail `personas` field is present, decodable, and contains at least one persona identifier, THE Metric_Emitter SHALL set the `persona` tag to the persona identifiers concatenated in ascending lexicographic order and separated by a single comma, such that any two personas collections containing the same identifiers produce an identical `persona` tag value regardless of their original order.
-7. WHERE the detail `personas` field is absent, not decodable, or decodable to an empty collection, THE Metric_Emitter SHALL set the `persona` tag to the literal value `unknown`.
-8. IF the outage duration was computed for the event by the Duration_Calculator, THEN THE Metric_Emitter SHALL set the `duration_available` tag to the literal value `true`.
-9. IF the outage duration was not computed for the event by the Duration_Calculator, THEN THE Metric_Emitter SHALL set the `duration_available` tag to the literal value `false`.
-10. THE Metric_Emitter SHALL render the `backup_event` tag as the literal value `true` or `false`, and SHALL render the `page` and `total_pages` tags as their base-10 integer string values.
-
-### Requirement 11: Tag the alert status metric with stable identity dimensions only
-
-**User Story:** As a dashboard consumer, I want the alert status metric tagged only with stable identity dimensions, so that the series is not fragmented across updates and pages, which keeps the per-series `max` or latest-point query meaningful.
-
-#### Acceptance Criteria
-
-1. WHEN submitting the Alert Status Metric, THE Metric_Emitter SHALL attach the tags `affected_account`, `event_arn`, `aws_service`, `affected_region`, `event_type_code`, and `event_scope_code`.
-2. WHEN submitting the Alert Status Metric, THE Metric_Emitter SHALL set the tag values from the corresponding fields as follows: `affected_account` from detail `affectedAccount`; `event_arn` to the Event Arn Tag Value derived from detail `eventArn`; `aws_service` from detail `service`; `affected_region` from detail `eventRegion`; `event_type_code` from detail `eventTypeCode`; `event_scope_code` from detail `eventScopeCode`.
-3. WHEN submitting the Alert Status Metric, THE Metric_Emitter SHALL exclude the update-varying tags `status_code`, `communication_id`, `page`, `total_pages`, and `backup_event`.
-4. WHEN submitting the Alert Status Metric, THE Metric_Emitter SHALL attach no tag other than the six tags `affected_account`, `event_arn`, `aws_service`, `affected_region`, `event_type_code`, and `event_scope_code`.
-5. WHEN submitting the Alert Status Metric, THE Metric_Emitter SHALL set the `event_arn` tag to the Event Arn Tag Value derived from the detail `eventArn` per Requirement 10 acceptance criterion 3.
-
-### Requirement 12: Emit a structured success result log
-
-**User Story:** As an operations engineer, I want a second structured log record for every successful invocation, so that a successful run produces an auditable normalized record distinct from the raw-event record.
-
-#### Acceptance Criteria
-
-1. WHEN all required validation has passed and the applicable metric submission attempts (the Received Metric, the Alert Status Metric, and, where applicable, the Duration Metric) have been made, THE Result_Logger SHALL write exactly one single-line JSON log record that satisfies both of the following conditions: its `record_type` value is distinct from the raw-event record's `record_type` value, AND it contains the normalized event information.
-2. THE Result_Logger SHALL write the structured success log record only after the Event_Logger has written the initial raw-event log record and after the applicable metric submission attempts have been made.
-3. WHEN an invocation completes successfully, THE Health_Telemetry_Lambda SHALL produce at least two single-line JSON log records: the initial raw-event record written by the Event_Logger and the structured success record written by the Result_Logger.
-4. THE Result_Logger SHALL include in the structured success record the normalized values used for the tags defined in Requirement 10.
-5. IF the Result_Logger cannot write the structured success log record, THEN THE Health_Telemetry_Lambda SHALL fail with Failure Category `unexpected_internal_failure`.
-
-### Requirement 13: Return categorized, non-nil errors on failure
-
-**User Story:** As an operations engineer, I want every parsing or validation failure to return a categorized non-nil Lambda error, so that asynchronous retries and the failure destination or DLQ can handle it, while best-effort telemetry failures do not fail the invocation.
-
-#### Acceptance Criteria
-
-1. IF a parsing, envelope validation, detail validation, required-timestamp, or unexpected internal processing step fails, THEN THE Health_Telemetry_Lambda SHALL return a non-nil error from the Lambda handler.
-2. WHEN the Health_Telemetry_Lambda returns an error, THE Health_Telemetry_Lambda SHALL associate the error with exactly one Failure Category from the defined set `envelope_json_parse_failure`, `envelope_validation_failure`, `detail_json_parse_failure`, `detail_validation_failure`, `required_timestamp_failure`, and `unexpected_internal_failure`.
-3. WHEN the Health_Telemetry_Lambda returns an error, THE Health_Telemetry_Lambda SHALL include in the returned error an indication of the associated Failure Category that the invoker can observe.
-4. IF more than one failure condition applies during an invocation, THEN THE Health_Telemetry_Lambda SHALL associate the error with the Failure Category of the earliest failed processing step.
-5. IF a failure occurs that does not correspond to any other defined Failure Category, THEN THE Health_Telemetry_Lambda SHALL associate the error with Failure Category `unexpected_internal_failure`.
-6. WHEN all required validation has passed, THE Health_Telemetry_Lambda SHALL return a nil error from the Lambda handler, regardless of whether every applicable metric submission completed successfully.
-7. IF a best-effort metric submission failure (Log Annotation `metric_submission_failure`) is the only failure that occurs and all required validation has passed, THEN THE Health_Telemetry_Lambda SHALL return a nil error from the Lambda handler.
-8. IF any required validation step fails, THEN THE Health_Telemetry_Lambda SHALL return a non-nil error, and a best-effort metric submission failure SHALL NOT change the associated Failure Category.
-
-### Requirement 14: Perform no filtering, persistence, lifecycle tracking, or deduplication
-
-**User Story:** As a system owner, I want the Lambda to remain stateless and single-purpose, so that all filtering, correlation, and deduplication responsibilities stay with the EventBridge rule and downstream consumers.
-
-#### Acceptance Criteria
-
-1. WHEN the Health_Telemetry_Lambda receives an event that passes validation, THE Health_Telemetry_Lambda SHALL emit telemetry regardless of the event's Region, service, or event-type field values, and SHALL NOT drop, skip, or suppress the event based on those values.
-2. THE Health_Telemetry_Lambda SHALL derive the telemetry it emits solely from the content of the current event, without reading or writing any state that persists across invocations.
-3. WHEN the Health_Telemetry_Lambda receives an event whose `eventArn`, `communicationId`, and `page` values match those of a previously received event, THE Health_Telemetry_Lambda SHALL emit telemetry for that event without suppressing it as a duplicate.
-4. THE Health_Telemetry_Lambda SHALL compute the alert status value and the outage duration solely from the current event's fields, without correlating against previously received events.
-5. WHEN the Health_Telemetry_Lambda is invoked repeatedly with identical input payloads, THE Health_Telemetry_Lambda SHALL produce identical telemetry output for each invocation.
-
-### Requirement 15: Preserve downstream correlation identifiers
-
-**User Story:** As a dashboard consumer, I want the identifiers needed for correlation and exact-delivery deduplication carried in telemetry, so that I can consolidate outage lifecycles and dedupe exact deliveries downstream.
-
-#### Acceptance Criteria
-
-1. WHEN submitting the Received Metric, THE Metric_Emitter SHALL set the `event_arn` tag to the Event Arn Tag Value derived from the detail `eventArn` and the `affected_account` tag from the detail `affectedAccount` value, so that downstream consumers can correlate a logical outage lifecycle; the Event Arn Tag Value includes the trailing unique identifier of the detail `eventArn` and is sufficient for lifecycle correlation.
-2. WHEN submitting the Received Metric, THE Metric_Emitter SHALL set the `event_arn` tag to the Event Arn Tag Value derived from the detail `eventArn`, the `affected_account` tag from the detail `affectedAccount` value, the `communication_id` tag from the detail `communicationId` value, and the `page` tag from the detail `page` value, so that downstream consumers can identify an exact delivered update using the `event_arn`, `communication_id`, and `page` tags together.
-3. WHEN submitting the Received Metric, THE Metric_Emitter SHALL set the `affected_account`, `communication_id`, and `page` tag values from their corresponding detail fields, and these tag values SHALL be subject to Datadog tag normalization, including the same 200-character safety cap defined for the Event Arn Tag Value; these values are expected to be well within that limit (a twelve-digit account ID, a short communication identifier, and a small integer page number), and THE Metric_Emitter SHALL set the `event_arn` tag to the Event Arn Tag Value defined in Requirement 10 acceptance criterion 3 rather than the full detail `eventArn`.
+Scope is limited to the Lambda source code, its build/packaging configuration, its tests, and its documentation.
 
 ## Out of Scope
 
-The following are explicitly out of scope for the Health_Telemetry_Lambda code covered by this specification:
+- Creating or modifying the EventBridge rule, IAM roles/policies, the Lambda function resource, or the Dead Letter Queue resource itself
+- Enabling or configuring the native Datadog AWS Health integration (already enabled in `aws_is0001_prod`)
+- Datadog API key, site, or client configuration in code (supplied by the Datadog Lambda layer)
+- Building Datadog dashboards or monitors (the dedup query pattern is documented, not deployed)
 
-- EventBridge rule filtering (Region, Safe-Landed Services, FIS event exclusion).
-- State persistence, deduplication, or any datastore.
-- DLQ resources and their configuration.
-- Lambda asynchronous retry and tuning infrastructure configuration.
-- Datadog dashboard, widgets, and queries.
-- Downstream correlation and consolidation logic.
-- Datadog authentication and transport internals.
+## Glossary
 
-### AWS Health event fields deliberately not emitted as metric tags
+- **Forwarder**: The Go AWS Lambda function in this repository that consumes AWS Health events and submits Datadog metrics.
+- **Health_Event**: A single AWS Health event, identified by its `eventArn`, delivered to the Forwarder inside an EventBridge event as the `detail` object.
+- **Health_Event_Detail**: The JSON object in the EventBridge `detail` field containing AWS Health fields such as `eventArn`, `service`, `statusCode`, `startTime`, `endTime`, `eventRegion`, `eventTypeCode`.
+- **Event_Payload**: The complete, unmodified JSON object the Forwarder receives for one invocation, including envelope fields (`account`, `source`, `detail-type`, `region`) and the `detail` object.
+- **Resolved_Event**: A Health_Event whose `detail.statusCode` equals `closed`.
+- **Duration_Metric**: The Datadog custom metric named `aws.health.events.duration`, submitted as a distribution, whose value is the outage duration of a Resolved_Event in seconds.
+- **Outage_Duration**: `endTime - startTime` of a Resolved_Event, expressed in seconds.
+- **Full_ARN**: The `detail.eventArn` value exactly as received, with no truncation or transformation (for example `arn:aws:health:af-south-1::event/EC2/AWS_EC2_OPERATIONAL_ISSUE/AWS_EC2_OPERATIONAL_ISSUE_7f35c8ae-af1f-54e6-a526-d0179ed6d68f`).
+- **Dead_Letter_Queue**: The pre-existing AWS queue that receives the Event_Payload of invocations the Forwarder cannot process. Referred to as the DLQ.
+- **Native_Integration**: The Datadog Amazon Health integration, which ingests AWS Health data as Datadog Events (identity, lifecycle, counts) and emits no metrics.
+- **Dedup_Query_Pattern**: The documented Datadog query shape `sum(max:aws.health.events.duration{<scope>} by {arn})`, which collapses duplicate deliveries per outage before summing across outages.
+- **Release_Bundle**: The deployment artifact for the Forwarder: a zip archive containing the compiled Linux Lambda binary, produced by GoReleaser.
+- **Documentation**: The repository `README.md` file delivered at the end of implementation.
 
-The metric tags carry only the dashboard-required dimensions and the downstream correlation identifiers (see Requirement 10 and Requirement 15). The following AWS Health event fields are parsed and validated where required elsewhere in this specification, but are DELIBERATELY NOT emitted as metric tags. This omission concerns only what becomes a metric TAG; it does not change any parsing or validation requirement. The complete original event remains available only in the initial raw-event log record, which is not sent to Datadog.
+## Requirements
 
-- **`eventDescription`**: Free-text payload with no query value that would exceed the Datadog tag length limit; available only in the raw-event log record.
-- **`startTime`, `endTime`, `lastUpdatedTime`**: Timestamps are an anti-pattern as tags because they are near-unique and not groupable; `startTime` and `endTime` are already consumed to compute `duration_seconds`, and the metric's own sample timestamp covers when the sample occurred.
-- **`eventMetadata`, `affectedEntities`**: Variable, high-cardinality payloads; resource-count metrics were explicitly excluded from v1, and these fields are available only in the raw-event log record.
-- **Envelope `resources`**: A list of resource ARNs; a high-cardinality payload with no dashboard axis.
-- **Envelope `source` and `detail-type`**: Effectively constant for this pipeline (for example `aws.health` and `AWS Health Event`), so they carry no query value.
-- **Envelope `id`**: Unique per delivery; `communication_id` together with `page` already identifies an exact delivery, so `id` would only add cardinality with no dashboard value.
-- **Envelope `time`**: The delivery timestamp, reserved as the input for the deferred future metric `aws_health.issue.delivery_delay_seconds`, and not emitted as a tag.
+### Requirement 1: Emit Outage Duration As A Single Renamed Distribution Metric
 
-## Notes and Deferred Decisions
+**User Story:** As an observability engineer, I want one clearly named duration metric emitted per resolved AWS Health event, so that I can measure real outage time without inheriting the old inflated metric's history.
 
-- Metrics deliberately excluded from v1: service-specific metrics, Region-specific metrics, separate open/closed metrics, resource-count metrics, and a custom Lambda-failure metric.
-- A possible future fourth metric, `aws_health.issue.delivery_delay_seconds`, is deferred.
-- The AWS Health EventBridge schema documents personas values with some inconsistency (for example `OPERATIONS` appears in examples while `OPERATIONAL` appears in field descriptions). Because `personas` is optional and decoded tolerantly, the `persona` tag representation does not depend on enum validation.
-- Metric tag cardinality decision (Option C): The Received Metric and the Duration Metric deliberately retain the complete tag set, including the high-cardinality identity tags (`event_arn`, `communication_id`) and the lifecycle tags (`page`, `total_pages`). The `event_arn` tag carries the Event Arn Tag Value (the extracted suffix after the first `event/` marker), which still includes the trailing unique identifier and therefore preserves correlation and exact-delivery deduplication semantics. This is an accepted, deliberate tradeoff. The EventBridge rule limits AWS Health events to Safe-Landed Services in only two Regions (us-east-1 and us-west-2), so the expected event and update volume is low and the resulting Datadog custom-metric cardinality and cost are not a concern for this feature. Retaining these tags preserves the downstream correlation and exact-delivery deduplication contract (see Requirement 15). If the event-volume assumption ever changes materially, this decision should be revisited; a candidate mitigation is to move the identity fields off the aggregation metrics to a separate channel such as the Datadog Events API.
-- Duration units and display: The Duration Metric `aws_health.issue.duration_seconds` is emitted in whole seconds as the raw unit. Conversion to minutes or hours is a downstream display concern handled in Datadog (via a formula query dividing by 60, or via the metric unit metadata), and the Health_Telemetry_Lambda does not emit minutes. This preserves precision and avoids baking a display choice into the emitted data.
-- Best-effort metric submission (Decision A): Locally-detectable metric submission errors (`metric_submission_failure`) are treated as best-effort, and this is the only best-effort Log Annotation. They are recorded as internal Log Annotations, not Failure Categories, and never cause the Health_Telemetry_Lambda to return a non-nil error. Only parsing, envelope validation, detail validation, required-timestamp, and unexpected-internal failures remain fail-closed and are handled by the DLQ. Tradeoff: if the Datadog Lambda Extension is unhealthy, individual telemetry data points may be silently lost rather than retried via the DLQ. This is accepted because the Alert Status Metric represents observed state rather than a guaranteed count and the event volume is low.
-- Delivery semantics and metric emission contract (Decision A): The Health_Telemetry_Lambda cannot guarantee exactly-once metric emission. EventBridge uses durable at-least-once delivery, and AWS Lambda asynchronous invocation can produce duplicate invocations even without a function error, so the same AWS Health event delivery may reach the Lambda more than once. There is no atomic transaction across the three metrics (Received, Alert Status, and Duration), so a single invocation can also emit them partially. The contract is therefore one submission attempt per applicable metric per handler invocation attempt, not exactly-once per delivery. Duplicate and partial emissions are expected and are resolved by downstream deduplication on `event_arn` + `communication_id` + `page`. Additionally, all three metrics (the Received Metric, the Alert Status Metric, and the Duration Metric) are submitted via the fire-and-forget DDLambda_Library `Metric` helper: it has no return value and buffers a distribution sample that the Datadog Lambda Extension flushes asynchronously, so the handler cannot observe final delivery success or failure for any of them. Only locally-detectable submission errors (for example a runtime error or panic during the submission call) are recorded; delivery to Datadog is never confirmed from within the handler.
-- Alert status semantics (Decision B): The Alert Status Metric represents the last status observed for a given outage series (last-write-wins per series). It may be stale or briefly out of order if EventBridge delivers lifecycle updates out of sequence, and it is not an authoritative guarantee of the current real-world state. Because the Alert Status Metric is now distribution-backed (submitted via `ddlambda.Metric`, not a true gauge), downstream consumers interpret it as observed state by querying the per-series `max` or the latest point per series. This is a semantic clarification only and does not change the `1` = open, `0` = closed or upcoming value rule.
-- Decision not to use DogStatsD (Decision A): The earlier plan to submit the Alert Status Metric as a true gauge via DogStatsD to the local Datadog Lambda Extension was dropped. All three metrics now use the DDLambda_Library distribution path for a single, uniform submission mechanism, accepting that the Alert Status Metric is distribution-backed and queried downstream as observed state (per-series `max` or the latest point per series).
-- Event Arn Tag Value derivation (Decision C): The `event_arn` tag on the Received, Duration, and Alert Status metrics carries the substring of the detail `eventArn` that follows the first occurrence of the marker `event/` (for example, `arn:aws:health:af-south-1::event/EC2/AWS_EC2_OPERATIONAL_ISSUE/AWS_EC2_OPERATIONAL_ISSUE_7f35c8ae-af1f-54e6-a526-d0179ed6d68f` yields `EC2/AWS_EC2_OPERATIONAL_ISSUE/AWS_EC2_OPERATIONAL_ISSUE_7f35c8ae-af1f-54e6-a526-d0179ed6d68f`). This keeps the tag value within the Datadog 200-character normalized tag limit while retaining the trailing unique identifier needed for correlation and deduplication. WHERE the detail `eventArn` does not contain the marker `event/`, the full detail `eventArn` value is used. As a last-resort safety measure, IF the resulting value would still exceed the 200-character limit it is truncated from the end, retaining the leading characters, to fit; truncation can impair exact deduplication and is expected only in pathological cases.
-- Event Arn Tag Value caveat (Decision C): Because the ARN's embedded Region prefix (for example `af-south-1`) precedes the `event/` marker, that Region prefix is dropped from the `event_arn` tag. The affected Region and delivery Region are still available as the separate `affected_region` and `delivery_region` tags, but the exact original `eventArn` cannot always be reconstructed from tags alone. The complete original `eventArn` is preserved in the initial raw-event log record (which is not sent to Datadog). This is acceptable for the dashboard use case.
+#### Acceptance Criteria
+
+1. WHEN the Forwarder processes a Resolved_Event whose `startTime` and `endTime` both parse without error using the AWS Health RFC2822 time layout, THE Forwarder SHALL submit exactly one Datadog distribution sample named `aws.health.events.duration` for that invocation, whose value equals the Outage_Duration computed as `endTime` minus `startTime` expressed as a signed number of seconds at whole-second granularity, with no rounding, clamping, unit conversion, or default substitution applied.
+2. THE Forwarder SHALL submit `aws.health.events.duration` as a Datadog distribution metric, and SHALL submit no other Datadog metric type under that metric name.
+3. WHEN the Forwarder processes a Health_Event whose `detail.statusCode` is any value other than the exact lowercase string `closed`, including an absent or empty `detail.statusCode`, THE Forwarder SHALL complete the invocation without returning an error, SHALL submit zero Datadog metric samples, and SHALL not route the Event_Payload to the Dead_Letter_Queue.
+4. THE Forwarder SHALL use `aws.health.events.duration` as the only Datadog custom metric name in its source and test files, and those files SHALL contain no occurrence of `aws.health.issue.received`, `aws.health.issue.alert_status`, or `aws.health.issue.duration_seconds`.
+5. IF a Resolved_Event has a parsed `endTime` earlier than its parsed `startTime`, THEN THE Forwarder SHALL submit the resulting negative Outage_Duration value unchanged, SHALL complete the invocation without returning an error, and SHALL write one log entry that indicates an inverted time range and includes the received `startTime` value, the received `endTime` value, and the `eventArn` value.
+6. THE Forwarder SHALL parse `startTime` and `endTime` using the AWS Health RFC2822 time layout `Mon, 2 Jan 2006 15:04:05 GMT`, and SHALL treat both parsed values as UTC instants when computing Outage_Duration.
+7. WHEN the Forwarder processes a Resolved_Event whose parsed `endTime` equals its parsed `startTime`, THE Forwarder SHALL submit one `aws.health.events.duration` sample whose value is 0 and SHALL complete the invocation without returning an error.
+
+### Requirement 2: Tag The Metric With A Stable, Join-Compatible Identity
+
+**User Story:** As an observability engineer, I want each duration sample tagged with the untrimmed event ARN, so that duplicates are collapsible at query time and metric series join cleanly with native Datadog AWS Health events.
+
+#### Acceptance Criteria
+
+1. WHEN the Forwarder submits an `aws.health.events.duration` sample, THE Forwarder SHALL attach exactly five tags, each formatted as `key:value`, exactly one tag per key, with the key set being `receiving_account`, `arn`, `aws_service`, `affected_region`, `event_type_code`, and SHALL attach no sixth tag key, in any tag ordering.
+2. THE Forwarder SHALL set the `arn` tag value to the Full_ARN, byte-for-byte identical to the received `detail.eventArn`, with no truncation, no splitting, no case change, no whitespace trimming, and no encoding of any character.
+3. THE Forwarder SHALL set `receiving_account` to the EventBridge envelope `account` value, `aws_service` to `detail.service`, `affected_region` to `detail.eventRegion`, and `event_type_code` to `detail.eventTypeCode`, each value copied verbatim from the received field with no case change, trimming, or substitution.
+4. THE Forwarder SHALL emit the `arn` tag key rather than the previous `event_arn` tag key, SHALL emit no `event_arn`, `event_scope_code`, or `status_code` tag key on any metric sample, and SHALL contain no function that truncates or shortens the `detail.eventArn` value.
+5. THE Forwarder SHALL emit each of the five tag strings, counting the key, the colon separator, and the value, at 200 characters or fewer, matching Datadog's 200-character tag limit.
+6. THE Forwarder SHALL set the `aws_service` tag value to the `detail.service` value with no case change, no whitespace trimming, and no substitution, so that the value matches the service value carried on Native_Integration events.
+7. WHEN the same Health_Event is delivered to the Forwarder two or more times as a Resolved_Event with unchanged `detail` field values, THE Forwarder SHALL emit on every one of those deliveries the same five tag key-value pairs character-for-character and the same metric value with no rounding or numeric difference between deliveries.
+8. THE Forwarder SHALL carry the ARN identity under the `arn` tag key only, and SHALL emit no alias tag key carrying the same ARN value, irrespective of any other pipeline component that still references the previous `event_arn` tag key.
+9. IF the EventBridge envelope `account` value, `detail.service`, `detail.eventRegion`, or `detail.eventTypeCode` is absent from the Event_Payload or is an empty string, THEN THE Forwarder SHALL emit that tag key with an empty value, SHALL emit the other four tag keys with their received values, and SHALL still submit the `aws.health.events.duration` sample.
+10. IF the `arn` tag string formed from the key, the colon separator, and the Full_ARN exceeds 200 characters, THEN THE Forwarder SHALL still emit the Full_ARN untruncated and SHALL write a log entry recording that the tag string exceeded the 200-character limit together with its character count.
+
+### Requirement 3: Route Unprocessable Payloads To The Dead Letter Queue
+
+**User Story:** As an on-call engineer, I want unprocessable health events preserved in the DLQ, so that I can inspect and replay the exact payload that failed instead of losing it silently.
+
+#### Acceptance Criteria
+
+1. IF the Forwarder cannot unmarshal the Event_Payload into a Health_Event_Detail, THEN THE Forwarder SHALL submit zero Datadog metric samples for that invocation and SHALL terminate that invocation with a failure result (a returned error), so that the asynchronous invocation path delivers the complete unmodified Event_Payload to the Dead_Letter_Queue.
+2. IF a Resolved_Event has a `startTime` or an `endTime` that is absent, is present as an empty string, or holds a value that is rejected by the AWS Health RFC2822 time layout `Mon, 2 Jan 2006 15:04:05 GMT`, THEN THE Forwarder SHALL submit zero Datadog metric samples for that invocation and SHALL terminate that invocation with a failure result (a returned error), so that the asynchronous invocation path delivers the complete unmodified Event_Payload to the Dead_Letter_Queue.
+3. WHEN the Forwarder terminates an invocation with a failure result, THE Forwarder SHALL write exactly one log entry naming the failure cause as exactly one of two values, parse failure or missing/unparseable timestamp, and SHALL include the `detail.eventArn` value in that log entry when `detail.eventArn` is present and non-empty, and SHALL record that the ARN is unavailable when `detail.eventArn` is absent or empty.
+4. THE Forwarder SHALL leave the Event_Payload byte-for-byte identical to the bytes it received, adding no field, removing no field, and reformatting no field or value, so that the payload delivered to the Dead_Letter_Queue is replayable without editing.
+5. WHEN the Forwarder successfully submits `aws.health.events.duration` for a Resolved_Event, THE Forwarder SHALL complete the invocation with a success result (no returned error) and SHALL NOT terminate the invocation in any way that routes the Event_Payload to the Dead_Letter_Queue.
+6. IF a Health_Event whose `detail.statusCode` differs from `closed` has a `startTime` or an `endTime` that is absent, empty, or unparseable with the AWS Health RFC2822 time layout, THEN THE Forwarder SHALL submit zero Datadog metric samples and SHALL complete the invocation with a success result (no returned error), so that the Event_Payload is not routed to the Dead_Letter_Queue.
+7. WHEN the same Event_Payload that previously produced a failure result is redelivered or replayed to the Forwarder unchanged, THE Forwarder SHALL produce the same failure result, the same named failure cause, and zero Datadog metric samples on every such invocation.
+
+### Requirement 4: Best-Effort, Stateless Delivery With Query-Time Deduplication
+
+**User Story:** As a platform engineer, I want the Forwarder to stay stateless and best-effort, so that it needs no datastore, no ordering guarantee, and no reconciliation job.
+
+#### Acceptance Criteria
+
+1. THE Forwarder SHALL derive every metric name, metric value, and tag value it emits for an invocation solely from the Event_Payload of that invocation, and SHALL read no persistent store, no cache, and no data written by any prior invocation.
+2. THE Forwarder SHALL write no record of a processed Health_Event to any persistent store, cache, or in-memory structure that outlives the invocation, while log entries and Dead_Letter_Queue delivery as defined in Requirement 3 remain permitted side effects.
+3. WHEN the Forwarder receives a set of Health_Events in any delivery order, including interleaved and duplicated deliveries of the same `eventArn`, THE Forwarder SHALL emit, for each of those deliveries, the same metric name, the same metric value, and the same tag set that it emits when that delivery is processed in any other order.
+4. IF the Forwarder cannot submit an `aws.health.events.duration` sample to Datadog, THEN THE Forwarder SHALL complete the invocation successfully, SHALL make no further submission attempt for that sample within the invocation, SHALL retain no record of the unsubmitted sample, SHALL write a log entry recording the failed submission including the `eventArn` value when that value is available, and SHALL not route the Event_Payload to the Dead_Letter_Queue.
+5. THE Documentation SHALL specify the Dedup_Query_Pattern `sum(max:aws.health.events.duration{<scope>} by {arn})`, explaining that the inner `max ... by {arn}` yields one value per outage and the outer `sum` counts each distinct outage once.
+6. THE Documentation SHALL state that a table widget using this metric must set rows to `arn` and column aggregation to `max` rather than `sum`.
+7. THE Documentation SHALL state that `arn` tag cardinality has an upper bound of one tag value per distinct Health_Event `eventArn`, that the Forwarder applies no truncation, sampling, or other cardinality reduction to that tag, and that this cardinality cost is accepted.
+8. THE Documentation SHALL state that metric delivery is best-effort, that a failed submission results in a permanently lost sample with no retry, no reconciliation job, and no Dead_Letter_Queue routing, and that duplicate samples are expected and are resolved at query time using the Dedup_Query_Pattern.
+9. WHEN the Forwarder runs in a reused Lambda execution environment, THE Forwarder SHALL emit for a given Event_Payload the same metric name, metric value, and tag set that it emits for that same Event_Payload in a newly initialized execution environment.
+
+### Requirement 5: Document The Native Integration Boundary And Join Compatibility
+
+**User Story:** As a dashboard author, I want the split between native Datadog AWS Health events and this metric documented, so that I query identity from events, duration from the metric, and join the two correctly.
+
+#### Acceptance Criteria
+
+1. THE Documentation SHALL state that Health_Event identity, lifecycle, and counts are obtained from Native_Integration Datadog Events and from no Datadog custom metric, and SHALL state that the `aws.health.issue.received` and `aws.health.issue.alert_status` metrics were removed because the Native_Integration supplies those three properties.
+2. THE Documentation SHALL state that the Native_Integration produces Datadog Events only, emits no metric, and cannot produce an Outage_Duration value, and SHALL give both stated reasons: AWS Health `startTime` and `endTime` arrive as RFC2822 strings, and the Datadog query layer provides no per-row date parsing and no per-row time subtraction.
+3. THE Documentation SHALL state that the Native_Integration is already enabled in the `aws_is0001_prod` account, that enabling or configuring the Native_Integration is out of scope for the Forwarder, and that a query spanning both sources must filter the AWS account id on each source separately, using the `receiving_account` tag on `aws.health.events.duration` and the AWS account id carried on Native_Integration events.
+4. THE Documentation SHALL state that a join between Native_Integration events and `aws.health.events.duration` matches the Full_ARN carried on the Native_Integration event against the `arn` tag value byte-for-byte, and SHALL state that a truncated or otherwise transformed ARN value returns zero matching series rather than a partial match or an error.
+5. THE Documentation SHALL state that cross-source filtering by service requires the `aws_service` tag value on `aws.health.events.duration` to be byte-for-byte identical to the service value carried on the corresponding Native_Integration event, and SHALL state that a mismatch returns zero matching series rather than an error.
+6. THE Documentation SHALL name exactly one source for each of these four properties: Health_Event identity, Health_Event lifecycle, Health_Event count, and Outage_Duration, assigning the first three to the Native_Integration and Outage_Duration to `aws.health.events.duration`.
+7. THE Documentation SHALL state that any comparison of Native_Integration event counts against `aws.health.events.duration` must apply the Dedup_Query_Pattern on the metric side, because duplicate deliveries otherwise yield more metric samples than distinct Native_Integration events for the same outage.
+
+### Requirement 6: Package The Function With GoReleaser
+
+**User Story:** As a release engineer, I want the deployment zip produced by GoReleaser, so that builds are repeatable and the artifact is ready to upload as Lambda code.
+
+#### Acceptance Criteria
+
+1. THE repository SHALL contain a GoReleaser configuration that builds the Forwarder from this Go module and produces the Release_Bundle as a single zip archive.
+2. WHEN a GoReleaser build runs, THE build SHALL compile the Forwarder for operating system `linux` and architecture `amd64` (x86_64) as the only build target, and SHALL include the resulting executable in the Release_Bundle zip archive.
+3. WHEN a GoReleaser build runs, THE build SHALL place the compiled executable at the top level of the Release_Bundle zip archive under the entry point name `bootstrap` required by the `provided.al2` and `provided.al2023` custom runtimes, with the owner-execute permission bit set, and SHALL include no other executable entry in that archive.
+4. WHEN a GoReleaser build runs, THE build SHALL complete with exit status 0 and SHALL write exactly one Release_Bundle zip archive to the repository `dist` directory.
+5. IF a GoReleaser build fails to compile the Forwarder or fails GoReleaser configuration validation, THEN THE build SHALL exit with a non-zero status, SHALL write no Release_Bundle zip archive to the repository `dist` directory, and SHALL report an error message identifying the failing compile or validation step.
+6. WHEN two GoReleaser builds run from the same repository commit, THE build SHALL produce Release_Bundle archives that contain the same set of entry names, the same entry paths within the archive, and the same entry permission bits.
+7. THE Documentation SHALL specify the GoReleaser command used to produce the Release_Bundle, the resulting artifact path within the repository `dist` directory, and the `bootstrap` entry point name inside the archive.
+
+### Requirement 7: Upgrade Dependencies To Latest Versions
+
+**User Story:** As a maintainer, I want the module on the latest dependency versions, so that the function ships with current fixes and a clean build.
+
+#### Acceptance Criteria
+
+1. THE `go.mod` file SHALL declare, for `github.com/DataDog/dd-trace-go/contrib/aws/datadog-lambda-go/v2` and for `github.com/aws/aws-lambda-go`, the highest stable released version available at implementation time, where a stable released version is a published semantic version with no pre-release suffix and no pseudo-version form, selected within the module's existing major version (`v2` for the Datadog contrib module, `v1` for `github.com/aws/aws-lambda-go`).
+2. THE `go.mod` file SHALL declare a version no lower than `v2.9.1` for `github.com/DataDog/dd-trace-go/contrib/aws/datadog-lambda-go/v2` and no lower than `v1.54.0` for `github.com/aws/aws-lambda-go`, and SHALL declare a `go` directive value no lower than `1.25.3`.
+3. WHEN the dependency upgrade is complete, THE build SHALL compile the module with exit status 0 and zero compile errors, and THE test suite SHALL execute every test present in the repository and pass with exit status 0, zero failures, and zero skipped tests.
+4. THE `go.sum` file SHALL contain checksum entries for every module in the build list of the upgraded `go.mod` file and no entries for modules absent from that build list, verified by a module verification command exiting with status 0 and by a module tidy command producing no further changes to `go.mod` or `go.sum`.
+5. THE Forwarder source code SHALL contain zero occurrences of a Datadog API key value, a Datadog site value, or a Datadog metrics endpoint value, and zero code paths that read those values from configuration or environment variables, relying instead on the Datadog Lambda layer for Datadog authentication and client configuration.
+6. IF declaring the highest stable released version of either module causes the build to exit with a non-zero status or causes one or more tests to fail, THEN THE `go.mod` file SHALL declare the highest stable released version of that module for which the build and the test suite both exit with status 0, and THE Documentation SHALL record the retained version and the reason the higher version was rejected.
+7. WHEN the dependency upgrade is complete, THE Forwarder SHALL satisfy every acceptance criterion of Requirements 1, 2, and 3 without changes to the emitted metric name, the emitted tag keys, the emitted tag values, or the emitted metric value for any given Event_Payload.
+
+### Requirement 8: Deliver Documentation
+
+**User Story:** As a new team member, I want a detailed README, so that I can understand what the function emits, why, and how to build and query it without reading the source.
+
+#### Acceptance Criteria
+
+1. THE Documentation SHALL state the purpose of the Forwarder, SHALL name the EventBridge AWS Health event as its only input, SHALL name `aws.health.events.duration` as its only output metric, and SHALL state that the Outage_Duration in seconds is the value the Forwarder supplies that the Native_Integration cannot.
+2. THE Documentation SHALL list the metric name `aws.health.events.duration`, its distribution type, its value semantics as Outage_Duration in seconds, and all five tag keys `receiving_account`, `arn`, `aws_service`, `affected_region`, `event_type_code`, each paired with its source field: the EventBridge envelope `account`, the untrimmed `detail.eventArn`, `detail.service`, `detail.eventRegion`, and `detail.eventTypeCode` respectively.
+3. THE Documentation SHALL state all three of the following facts about the duplicate-delivery defect: that EventBridge redelivers the same Resolved_Event so that summing the previous metric inflated totals (the observed `multiple_services` total of 10,325 seconds), that no query-only fix is possible because the previous metric carried no per-outage identity tag and the Forwarder must remain stateless with no database and no cache, and that `detail.eventArn` is stable across every delivery of one Health_Event while `communicationId` changes on each delivery.
+4. THE Documentation SHALL describe both Dead_Letter_Queue conditions defined in Requirement 3, an Event_Payload that cannot be unmarshalled into a Health_Event_Detail, and a Resolved_Event with a missing or unparseable `startTime` or `endTime`, and SHALL state that the complete unmodified Event_Payload is preserved in the Dead_Letter_Queue and that zero Datadog metric samples are submitted for that invocation.
+5. THE Documentation SHALL specify one runnable command for each of the following three tasks: compiling the module, running the test suite, and producing the Release_Bundle with GoReleaser, and SHALL state that the Release_Bundle is written to the repository `dist` directory.
+6. THE Documentation SHALL state that Datadog metrics are submitted as distributions because the Datadog Lambda library submits distributions, and that gauge or count submission would require the DogStatsD endpoint on `127.0.0.1:8125` or the Datadog HTTP API.
+7. THE Documentation SHALL state that a Health_Event whose `detail.statusCode` differs from `closed` yields a successful invocation with zero metric samples, so that the absence of samples for non-closed events is not read as a failure.
+8. THE Documentation SHALL list the removed metric names `aws.health.issue.received`, `aws.health.issue.alert_status`, and `aws.health.issue.duration_seconds`, and SHALL state that the previous `event_arn` tag key is replaced by the `arn` tag key.
+9. WHEN implementation is complete, THE Documentation SHALL exist as the repository `README.md` file and SHALL contain a section covering each topic required by criteria 1 through 8 of this requirement.
