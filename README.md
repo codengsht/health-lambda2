@@ -201,6 +201,33 @@ unchanged, logs an inverted-range line carrying the received `startTime`, `endTi
 unprocessable — it is upstream data that contradicts itself, and clamping it would fabricate a
 duration and hide the problem.
 
+## Repository layout
+
+```
+main.go                        entry point: lambda.Start(ddlambda.WrapFunction(forwarder.Handle, nil))
+internal/forwarder/
+  doc.go                       package overview and the layering map
+  types.go                     HealthEventDetail, metricSample, notice, evaluation
+  errors.go                    the two named failure causes and processingError
+  duration.go                  outageDuration and the AWS Health RFC2822 layout
+  tags.go                      metricTags and oversizedTags
+  evaluate.go                  evaluate: the single pure decision function
+  handler.go                   Handle: the impure edge, and the submitMetric seam
+  *_test.go                    unit, example, property-based, and hygiene tests
+.goreleaser.yaml               packaging: one linux/amd64 zip with bootstrap at the root
+```
+
+`main.go` holds no behaviour: everything lives in `internal/forwarder`, which keeps the
+package importable only from inside this module. `duration.go`, `tags.go`, and `evaluate.go`
+are pure — arguments in, values out, no I/O and no package state. `handler.go` is the only
+file that performs side effects, and `submitMetric` is the only submission point.
+
+Go requires test files to sit in the same directory as the package they test, so the
+`*_test.go` files live in `internal/forwarder` alongside the code. They are not part of the
+build: `go build` and GoReleaser ignore `*_test.go` entirely, so the release archive contains
+only the `bootstrap` binary, and the test-only `pgregory.net/rapid` dependency is never linked
+in.
+
 ## Build, test, release
 
 ```sh

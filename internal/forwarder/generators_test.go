@@ -1,4 +1,4 @@
-package main
+package forwarder
 
 // Rapid generators shared by every property test in this package.
 //

@@ -1,10 +1,16 @@
-package main
+package forwarder
 
 // hygiene_test.go asserts repository-level facts that the property tests cannot
 // express: that removed metric names, the deleted ARN-trimming helper, Datadog
 // credential/endpoint configuration, AWS SDK or SQS clients, and any
-// re-marshalling of the Event_Payload are all absent from this package's Go
+// re-marshalling of the Event_Payload are all absent from the module's Go
 // sources.
+//
+// Scan scope: the whole module, not just this package. The scanner locates the
+// module root by walking up to go.mod and then walks every *.go file beneath it,
+// so the root main.go entry point and any future package are covered by the same
+// rules as this one. Requirements 1.4, 2.4, and 7.5 are obligations on the
+// Forwarder's source, wherever in the module it lives.
 //
 // Self-reference: a source scanner that lives in the package it scans would
 // normally flag itself, because it has to name the very literals it forbids.
@@ -26,7 +32,9 @@ package main
 import (
 	"go/parser"
 	"go/token"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -38,39 +46,81 @@ func literalOf(fragments ...string) string {
 	return strings.Join(fragments, "")
 }
 
-// goSource is one scanned file: its name and its full contents.
+// goSource is one scanned file: its module-relative path and its full contents.
 type goSource struct {
 	Name    string
 	Content string
 }
 
-// packageGoSources reads every *.go file in the package directory.
+// moduleRoot walks up from the test's working directory until it finds the
+// directory holding go.mod, so the scan covers the module rather than whichever
+// package the test happens to live in.
+func moduleRoot(t *testing.T) string {
+	t.Helper()
+
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("resolving working directory: %v", err)
+	}
+
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("no go.mod found in any parent directory; cannot locate the module root")
+		}
+		dir = parent
+	}
+}
+
+// packageGoSources reads every *.go file in the module, keyed by its path
+// relative to the module root. Build output and vendored code are skipped.
 func packageGoSources(t *testing.T) []goSource {
 	t.Helper()
 
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("reading package directory: %v", err)
-	}
+	root := moduleRoot(t)
 
 	var sources []goSource
-	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") {
-			continue
-		}
-		content, err := os.ReadFile(entry.Name())
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
-			t.Fatalf("reading %s: %v", entry.Name(), err)
+			return err
 		}
-		sources = append(sources, goSource{Name: entry.Name(), Content: string(content)})
+		if entry.IsDir() {
+			switch entry.Name() {
+			case "vendor", "dist", ".git":
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(entry.Name(), ".go") {
+			return nil
+		}
+
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		sources = append(sources, goSource{Name: relative, Content: string(content)})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walking the module for Go sources: %v", err)
 	}
 
 	if len(sources) == 0 {
-		t.Fatal("no *.go files found in the package directory; the hygiene scan would pass vacuously")
+		t.Fatal("no *.go files found in the module; the hygiene scan would pass vacuously")
 	}
-	// The scanner must at least see the production source and itself.
-	if !containsFile(sources, "main.go") {
-		t.Fatalf("main.go not among scanned files: %v", fileNames(sources))
+	// The scanner must at least see the entry point and the handler.
+	for _, required := range []string{"main.go", filepath.Join("internal", "forwarder", "handler.go")} {
+		if !containsFile(sources, required) {
+			t.Fatalf("%s not among scanned files: %v", required, fileNames(sources))
+		}
 	}
 	return sources
 }

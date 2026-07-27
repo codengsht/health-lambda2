@@ -1,4 +1,4 @@
-package main
+package forwarder
 
 // Tests for the AWS Health event forwarder live here.
 //
@@ -373,7 +373,7 @@ func noticesOfKind(notices []notice, kind noticeKind) []notice {
 
 // --- Handler test scaffolding: the fake submission sink and log capture ------
 //
-// These helpers are shared by every test that drives handleRequest, including
+// These helpers are shared by every test that drives Handle, including
 // the rapid property tests in properties_failure_test.go, so they accept the
 // small interface both *testing.T and *rapid.T satisfy rather than *testing.T.
 
@@ -395,7 +395,7 @@ type recordedSubmission struct {
 
 // recordSubmissions replaces the package-level submitMetric seam with a fake
 // that appends every call to a slice, and restores the previous value through
-// t.Cleanup. The returned pointer is read after driving handleRequest, so tests
+// t.Cleanup. The returned pointer is read after driving Handle, so tests
 // can assert the exact number of submissions and their contents without a
 // Datadog endpoint. Tags are copied, so a later reuse of the caller's slice
 // cannot alter what was recorded.
@@ -472,8 +472,8 @@ func TestHandleRequestSubmitsOneSamplePerClosedEvent(t *testing.T) {
 	submissions := recordSubmissions(t)
 	captureLogOutput(t)
 
-	if err := handleRequest(context.Background(), healthEvent(t, "123456789012", detail)); err != nil {
-		t.Fatalf("handleRequest returned error: %v", err)
+	if err := Handle(context.Background(), healthEvent(t, "123456789012", detail)); err != nil {
+		t.Fatalf("Handle returned error: %v", err)
 	}
 
 	if len(*submissions) != 1 {
@@ -516,8 +516,8 @@ func TestHandleRequestSubmitsZeroForEqualTimestamps(t *testing.T) {
 	submissions := recordSubmissions(t)
 	captureLogOutput(t)
 
-	if err := handleRequest(context.Background(), healthEvent(t, "123456789012", detail)); err != nil {
-		t.Fatalf("handleRequest returned error: %v", err)
+	if err := Handle(context.Background(), healthEvent(t, "123456789012", detail)); err != nil {
+		t.Fatalf("Handle returned error: %v", err)
 	}
 
 	if len(*submissions) != 1 {
@@ -542,8 +542,8 @@ func TestHandleRequestLogsEverySubmissionExactlyOnce(t *testing.T) {
 	submissions := recordSubmissions(t)
 	logs := captureLogOutput(t)
 
-	if err := handleRequest(context.Background(), healthEvent(t, "123456789012", detail)); err != nil {
-		t.Fatalf("handleRequest returned error: %v", err)
+	if err := Handle(context.Background(), healthEvent(t, "123456789012", detail)); err != nil {
+		t.Fatalf("Handle returned error: %v", err)
 	}
 
 	// Best-effort delivery: one attempt per invocation, never retried, and the
@@ -608,9 +608,9 @@ func TestHandleRequestLogsParseFailureCauseExactlyOnce(t *testing.T) {
 	submissions := recordSubmissions(t)
 	logs := captureLogOutput(t)
 
-	err := handleRequest(context.Background(), event)
+	err := Handle(context.Background(), event)
 	if err == nil {
-		t.Fatal("handleRequest returned nil for an unmarshalable detail, want error")
+		t.Fatal("Handle returned nil for an unmarshalable detail, want error")
 	}
 
 	var perr *processingError
@@ -655,9 +655,9 @@ func TestHandleRequestLogsBadTimestampCauseExactlyOnce(t *testing.T) {
 	submissions := recordSubmissions(t)
 	logs := captureLogOutput(t)
 
-	err := handleRequest(context.Background(), healthEvent(t, "123456789012", detail))
+	err := Handle(context.Background(), healthEvent(t, "123456789012", detail))
 	if err == nil {
-		t.Fatal("handleRequest returned nil for a closed event with a bad timestamp, want error")
+		t.Fatal("Handle returned nil for a closed event with a bad timestamp, want error")
 	}
 
 	var perr *processingError

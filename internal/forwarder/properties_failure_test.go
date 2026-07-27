@@ -1,4 +1,4 @@
-package main
+package forwarder
 
 // Property tests for the Forwarder's failure paths.
 //
@@ -137,7 +137,7 @@ func ensureMinimumChecksProperty6(t *testing.T) {
 // the submission sink and returns an error whose named cause is "parse failure",
 // recording that the ARN is unavailable.
 //
-// The property runs through handleRequest — the only place a submission can
+// The property runs through Handle — the only place a submission can
 // happen — with submitMetric swapped for a recording fake, so "submits nothing"
 // is asserted against the sink rather than inferred from the pure core.
 //
@@ -164,10 +164,10 @@ func TestProperty6UnmarshalableDetailAlwaysFailsWithParseCauseAndSubmitsNothing(
 			Detail:     payload,
 		}
 
-		err := handleRequest(context.Background(), event)
+		err := Handle(context.Background(), event)
 
 		if err == nil {
-			t.Fatalf("handleRequest returned no error for detail %q", payload)
+			t.Fatalf("Handle returned no error for detail %q", payload)
 		}
 		if len(*submissions) != 0 {
 			t.Fatalf("recorded %d submissions for detail %q, want 0: %+v",
@@ -176,7 +176,7 @@ func TestProperty6UnmarshalableDetailAlwaysFailsWithParseCauseAndSubmitsNothing(
 
 		var perr *processingError
 		if !errors.As(err, &perr) {
-			t.Fatalf("handleRequest returned %T (%v), want a *processingError", err, err)
+			t.Fatalf("Handle returned %T (%v), want a *processingError", err, err)
 		}
 		if perr.Cause != causeParseFailure {
 			t.Fatalf("failure cause = %q, want %q", perr.Cause, causeParseFailure)

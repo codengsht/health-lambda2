@@ -1,4 +1,4 @@
-package main
+package forwarder
 
 // Property tests over the Forwarder's duration arithmetic and status gating.
 //

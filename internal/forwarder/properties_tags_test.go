@@ -1,4 +1,4 @@
-package main
+package forwarder
 
 // Property tests over the tag set the Forwarder attaches to every
 // aws.health.events.duration sample.
