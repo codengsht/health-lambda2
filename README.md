@@ -1,18 +1,16 @@
 # AWS Health Event Forwarder
 
-## Purpose
+A Go AWS Lambda function that turns resolved AWS Health events into one Datadog custom metric.
+Its only input is an AWS Health event delivered by EventBridge, and its only output is the
+Datadog distribution metric `aws.health.events.duration`.
 
-The AWS Health Event Forwarder is a Go AWS Lambda function that turns resolved AWS Health
-events into one Datadog custom metric. Its only input is an AWS Health event delivered by
-EventBridge, and its only output is the Datadog metric `aws.health.events.duration`.
+What it supplies is the outage duration in seconds (`endTime - startTime`), which the native
+Datadog AWS Health integration cannot produce. That integration ingests AWS Health data as
+Datadog Events, and Datadog Events carry no numeric metric value. Everything else about a
+health event — identity, lifecycle, counts — comes from the native integration rather than from
+this function.
 
-The value the Forwarder supplies is the outage duration in seconds (`endTime - startTime`),
-which the native Datadog Amazon Health integration cannot provide. The native integration
-ingests AWS Health data as Datadog Events, and Datadog Events carry no numeric metric value.
-Everything else about a health event — identity, lifecycle, counts — comes from the native
-integration, not from this function.
-
-The function is stateless: it reads no database and no cache, keeps nothing between
+The function is stateless. It reads no database and no cache, keeps nothing between
 invocations, and derives every metric name, value, and tag solely from the payload of the
 invocation it is handling.
 
@@ -24,70 +22,69 @@ One metric is emitted, and only for events whose `detail.statusCode` is exactly 
 | --- | --- |
 | Name | `aws.health.events.duration` |
 | Type | Datadog **distribution** |
-| Value | Outage duration in seconds: parsed `detail.endTime` minus parsed `detail.startTime`, signed, whole-second granularity, no rounding, clamping, unit conversion, or default substitution |
+| Value | Outage duration in seconds: parsed `detail.endTime` minus parsed `detail.startTime`, signed, whole-second granularity, with no rounding, clamping, unit conversion, or default substitution |
 | Samples per invocation | Exactly one for a closed event with parseable timestamps; zero otherwise |
 
-Timestamps are parsed with the AWS Health RFC2822 layout `Mon, 2 Jan 2006 15:04:05 GMT`.
-The trailing `GMT` is a literal in that layout, so both endpoints are UTC instants and the
-difference is zone-independent.
+Timestamps are parsed with the AWS Health RFC2822 layout `Mon, 2 Jan 2006 15:04:05 GMT`. The
+trailing `GMT` is a literal in that layout, so both endpoints are UTC instants and the
+difference between them is zone-independent.
 
 Exactly five tags are attached to every sample — one tag per key, no sixth key:
 
 | Tag key | Source field | Notes |
 | --- | --- | --- |
 | `receiving_account` | EventBridge envelope `account` | The AWS account that received the event |
-| `arn` | `detail.eventArn` | The **full, untrimmed** event ARN, byte-for-byte as received |
-| `aws_service` | `detail.service` | Copied verbatim, no case change or trimming |
+| `arn` | `detail.eventArn` | The **full, untrimmed** event ARN, exactly as received. Datadog lowercases it on ingest; see the join notes below |
+| `aws_service` | `detail.service` | Passed through with no case change or trimming |
 | `affected_region` | `detail.eventRegion` | The region the health event affects |
 | `event_type_code` | `detail.eventTypeCode` | For example `AWS_EC2_OPERATIONAL_ISSUE` |
 
-Every value is copied verbatim: no trimming, case folding, escaping, truncation, or
-empty-value fallback. If a source field is absent or empty, the tag is still emitted with an
-empty value (`aws_service:`), the other four keys carry their received values, and the sample
-is still submitted.
+Every value is a raw copy of its source field: no trimming, case folding, escaping, truncation,
+or empty-value fallback. If a source field is absent or empty, the tag is still emitted with an
+empty value (`aws_service:`), the other four keys carry their received values, and the sample is
+still submitted.
 
 Datadog's per-tag limit is 200 characters, counting the key, the colon, and the value. If
-`arn:<eventArn>` exceeds that limit, the Forwarder still emits the ARN in full and untruncated
-and writes a log line recording the tag key and its character count. Truncating would break
-the byte-for-byte join described below, so the limit is reported rather than enforced.
+`arn:<eventArn>` exceeds that limit, the Forwarder still emits the ARN in full and untruncated,
+and writes a log line recording the tag key and its character count. Truncating would break the
+cross-source join described below, so the limit is reported rather than enforced.
 
-## Why this exists: the duplicate-delivery defect
+The tightest real case is a `multiple_services` ARN with a full event-id suffix, which comes to
+roughly 170 characters once the `arn:` key prefix is counted — under the limit, but with only
+about 30 characters of headroom. That log line is the early warning if AWS ever lengthens the
+suffix.
 
-EventBridge redelivers the same AWS Health event several times across its lifecycle. The
-previous metric, `aws.health.issue.duration_seconds`, was a distribution with no per-outage
-identity tag, so two deliveries of one resolved event were indistinguishable from two genuine
-outages of equal length. Any dashboard widget that summed the metric inflated total outage
-time — the observed `multiple_services` total reached 10,325 seconds.
+## Duplicate deliveries and how to query around them
 
-No query-only fix was possible. Collapsing duplicates requires a stable per-outage identity
-tag on the metric itself, and the old metric carried none. The function also has to remain
-stateless — no database, no cache — so it cannot remember which events it has already seen and
-suppress repeats at submission time.
+EventBridge redelivers the same AWS Health event several times across its lifecycle, and the
+resolving delivery can arrive more than once. Every such delivery carries the same `startTime`
+and `endTime`, so each produces a sample with an identical value. Summing raw samples therefore
+double-counts a single outage and inflates total outage time.
 
-The identity tag is the event ARN, because `detail.eventArn` is stable across every lifecycle
-delivery of one health event. `communicationId`, the other candidate, changes on each delivery
-and therefore cannot identify an outage.
+Deduplication is a query-time concern, not a submission-time one. A stateless function cannot
+remember which events it has already seen, so instead each sample carries a stable per-outage
+identity in the `arn` tag. `detail.eventArn` is the right key because it is identical across
+every lifecycle delivery of one health event, whereas `communicationId` changes on each delivery
+and so cannot identify an outage.
 
-## Query patterns
-
-Duplicate samples are expected. Collapse them at query time with the dedup pattern:
+Collapse duplicates with the dedup pattern:
 
 ```
 sum(max:aws.health.events.duration{<scope>} by {arn})
 ```
 
-The inner `max ... by {arn}` reduces every duplicate delivery of one outage to a single value
-(all deliveries of the same resolved event carry the same duration, so the max *is* that
-duration). The outer `sum` then adds each distinct outage exactly once. Summing without the
-inner `max` is the defect described above.
+The inner `max ... by {arn}` reduces every duplicate delivery of one outage to a single value —
+all deliveries of the same resolved event carry the same duration, so the max *is* that
+duration. The outer `sum` then adds each distinct outage exactly once. This works whether
+redeliveries land in the same rollup window or hours apart.
 
 For a table widget, set **rows** to `arn` and **column aggregation** to `max`, not `sum`. A
-`sum` column aggregation re-introduces the inflation inside each row.
+`sum` column aggregation reintroduces the inflation inside each row.
 
 Cardinality: the `arn` tag has an upper bound of one tag value per distinct health event
-`eventArn`. The Forwarder applies no truncation, no sampling, and no other cardinality
-reduction to that tag. This cardinality cost is accepted — it is what makes query-time dedup
-and the join against native events possible.
+`eventArn`. No truncation, sampling, or other cardinality reduction is applied to it. That cost
+is accepted deliberately — it is what makes query-time dedup and the join against native events
+possible at all.
 
 ## Delivery semantics
 
@@ -100,23 +97,22 @@ Metric delivery is **best-effort**:
 - No record of an unsubmitted sample is retained anywhere.
 - Duplicate samples are expected and are resolved at query time with the dedup pattern above.
 
-The reason is a library constraint. The Forwarder submits through
-`ddlambda.Metric(name string, value float64, tags ...string)`, which returns nothing.
-Samples are buffered by the wrapper installed by `ddlambda.WrapFunction` and flushed to
-Datadog by the Datadog Lambda layer after the handler returns, so a transport failure happens
-outside the handler's lifetime and is never reported to it. There is no error value, no
-callback, and no status the function can inspect, so there is no submission-error branch in
-the code.
+This follows from a library constraint. Submission goes through
+`ddlambda.Metric(name string, value float64, tags ...string)`, which returns nothing. Samples
+are buffered by the wrapper installed by `ddlambda.WrapFunction` and flushed to Datadog by the
+Datadog Lambda layer after the handler returns, so a transport failure happens outside the
+handler's lifetime and is never reported to it. There is no error value, no callback, and no
+status the function can inspect, so there is no submission-error branch in the code.
 
-What the Forwarder does instead: it logs one line per attempted submission carrying the metric
+What the function does instead is log one line per attempted submission carrying the metric
 name, the value, and the `eventArn`. A sample Datadog never ingests is therefore still
 reconstructible from CloudWatch Logs, and the Datadog layer writes its own transport errors to
 the same log group.
 
 ## Native integration boundary
 
-The native Datadog Amazon Health integration and this metric are complementary, and each
-property has exactly one source:
+The native Datadog AWS Health integration and this metric are complementary. Each property has
+exactly one source:
 
 | Property | Source |
 | --- | --- |
@@ -125,43 +121,71 @@ property has exactly one source:
 | Health event count | Native integration Datadog Events |
 | Outage duration | `aws.health.events.duration` |
 
-Identity, lifecycle, and counts come from native integration Datadog Events and from no
-Datadog custom metric. The `aws.health.issue.received` and `aws.health.issue.alert_status`
-metrics were removed for exactly that reason: the native integration already supplies those
-three properties.
+Identity, lifecycle, and counts come from native integration Datadog Events and from no Datadog
+custom metric. This function emits nothing for those three properties.
 
-The native integration produces Datadog Events only. It emits no metric and cannot produce an
-outage duration value, for two reasons: AWS Health `startTime` and `endTime` arrive as RFC2822
+The native integration produces Datadog Events only. It emits no metric and cannot compute an
+outage duration, for two reasons: AWS Health `startTime` and `endTime` arrive as RFC2822
 strings, and the Datadog query layer provides no per-row date parsing and no per-row time
 subtraction. Computing the duration in the Lambda is the only way to get a numeric duration
 series.
 
-The native integration is **already enabled** in the `aws_is0001_prod` account. Enabling or
-configuring it is out of scope for the Forwarder. A query spanning both sources must filter
-the AWS account id on each source separately: use the `receiving_account` tag on
-`aws.health.events.duration`, and the AWS account id carried on native integration events.
-There is no shared account facet across the two sources.
+The native integration is already enabled in the `aws_is0001_prod` account, and this repository
+does not configure it. A query spanning both sources must filter the AWS account id on each
+source separately, using the `receiving_account` tag on `aws.health.events.duration` and the
+account tag carried on native integration events. There is no shared account facet across the
+two sources.
 
-Joining the two sources matches the full ARN carried on the native integration event against
-the `arn` tag value **byte-for-byte**. A truncated or otherwise transformed ARN value returns
-zero matching series — not a partial match, and not an error. That silent-empty behaviour is
-why the Forwarder emits the ARN untrimmed even when the tag string exceeds 200 characters.
+### Joining the two sources
 
-The same applies to service filtering across sources: the `aws_service` tag value on
-`aws.health.events.duration` must be byte-for-byte identical to the service value carried on
-the corresponding native integration event. A mismatch returns zero matching series rather
-than an error.
+Correlation matches the full ARN carried on the native integration event against the `arn` tag
+value, over the whole string. A truncated or otherwise transformed ARN value returns zero
+matching series — not a partial match, and not an error.
+
+One detail governs that comparison: Datadog normalizes metric tags to lowercase on ingest, so
+the value stored is not the value submitted. AWS sends mixed case
+(`.../MULTIPLE_SERVICES/AWS_MULTIPLE_SERVICES_OPERATIONAL_ISSUE/...`), the Forwarder passes it
+through untouched, and Datadog folds it. The native integration's own `arn` tag is folded the
+same way, so both sides converge on the identical lowercase string and the correlation holds.
+Both halves of this have been confirmed against live series in `aws_is0001_prod`.
+
+Two consequences follow. Case folding is not something the Forwarder should replicate in code:
+doing so would change nothing observable downstream while making the emitted tag diverge from
+the source field. And "verbatim" throughout this document describes what the function
+*submits*; what Datadog *stores* is the normalized form.
+
+Service filtering across sources works the same way: the `aws_service` tag value must match the
+service value on the corresponding native integration event under that same normalization. A
+mismatch returns zero matching series rather than an error.
+
+### Native integration tag schema
+
+Tags observed on a closed native AWS Health event in `aws_is0001_prod`, alongside the Forwarder
+tag corresponding to each:
+
+| Native event tag | Forwarder tag | Notes |
+| --- | --- | --- |
+| `arn` | `arn` | The only key that aligns on both sources; the correlation key |
+| `service` | `aws_service` | Same value, different key |
+| `region` | `affected_region` | Same value, different key |
+| `event_code` | `event_type_code` | Same value, different key |
+| `aws_account` | `receiving_account` | Confirm before relying on it: the native tag may carry the affected account rather than the receiving one, and those diverge under organizational health event aggregation |
+| `source`, `event_category`, `status`, `event_start_time`, `event_end_time` | — | Native only; this function emits no equivalent |
+
+Because `arn` is the one key present on both sources, the practical correlation mechanism is a
+dashboard template variable scoped on `arn` driving both an event widget and a metric widget.
+Datadog has no single query that joins events to metrics.
 
 Comparing native integration event counts against `aws.health.events.duration` requires the
 dedup pattern on the metric side. Without it, duplicate deliveries yield more metric samples
-than distinct native integration events for the same outage, and the comparison is meaningless.
+than distinct native events for the same outage, and the comparison is meaningless.
 
 ## Non-closed events
 
 A health event whose `detail.statusCode` is anything other than the exact lowercase string
 `closed` — including `open`, `upcoming`, `Closed`, `CLOSED`, an empty value, or an absent
-field — yields a **successful invocation with zero metric samples**. The delivery is logged
-and the payload is not routed to the dead letter queue.
+field — yields a **successful invocation with zero metric samples**. The delivery is logged and
+the payload is not routed to the dead letter queue.
 
 The comparison is an exact byte comparison: no case folding and no whitespace trimming.
 
@@ -174,32 +198,48 @@ delivery produces a sample.
 Two conditions fail the invocation, which routes the payload to the pre-existing dead letter
 queue:
 
-1. **Unmarshalable payload** — the EventBridge `detail` cannot be unmarshalled into the
-   health event detail structure. Logged as cause `parse failure` with an ARN-unavailable note.
+1. **Unmarshalable payload** — the EventBridge `detail` cannot be unmarshalled into the health
+   event detail structure. Logged as cause `parse failure` with an ARN-unavailable note.
 2. **Closed event with a bad timestamp** — `detail.statusCode` is `closed` and `startTime` or
    `endTime` is absent, is an empty string, or is rejected by the layout
    `Mon, 2 Jan 2006 15:04:05 GMT`. Logged as cause `missing/unparseable timestamp` together
    with the `eventArn` and the received timestamps.
 
-In both cases zero Datadog metric samples are submitted for that invocation, and exactly one
-log line names the cause.
+In both cases zero Datadog metric samples are submitted for that invocation, and exactly one log
+line names the cause.
 
 The **complete, unmodified payload is preserved** in the dead letter queue, so it can be
-inspected and replayed without editing. This holds structurally rather than by careful coding:
-routing happens by returning an error on the asynchronous invocation path, so the Lambda
-service delivers the payload *it* holds — the bytes EventBridge sent. The Forwarder contains
-no code path that serializes, edits, or forwards the payload, and no SQS or AWS SDK client.
+inspected and replayed without editing. That holds structurally rather than by careful coding:
+routing happens by returning an error on the asynchronous invocation path, so the Lambda service
+delivers the payload *it* holds — the bytes EventBridge sent. There is no code path in this
+repository that serializes, edits, or forwards the payload, and no SQS or AWS SDK client.
 
-One consequence of the asynchronous path: retries mean a failing payload is processed more
-than once before it is dead-lettered. Because evaluation is a pure function of the payload,
-every attempt reaches the same cause and emits zero samples, so retries are harmless.
+One consequence of the asynchronous path: retries mean a failing payload is processed more than
+once before it is dead-lettered. Because evaluation is a pure function of the payload, every
+attempt reaches the same cause and emits zero samples, so retries are harmless.
 
-Note that an inverted time range is *not* a dead-letter condition. If a closed event has a
-parsed `endTime` earlier than its parsed `startTime`, the Forwarder submits the negative value
+An inverted time range is *not* a dead-letter condition. If a closed event has a parsed
+`endTime` earlier than its parsed `startTime`, the function submits the negative value
 unchanged, logs an inverted-range line carrying the received `startTime`, `endTime`, and
 `eventArn`, and completes successfully. Both timestamps parsed, so the payload is not
 unprocessable — it is upstream data that contradicts itself, and clamping it would fabricate a
 duration and hide the problem.
+
+## Logging
+
+One log line per event, each a single `log.Printf`:
+
+| Situation | Content |
+| --- | --- |
+| Invocation start | `source`, `detail-type`, `region` |
+| Parse failure | cause `parse failure`, ARN-unavailable note |
+| Bad timestamp | cause `missing/unparseable timestamp`, `eventArn` or ARN-unavailable note, the received `startTime` and `endTime` |
+| Non-closed delivery | `statusCode`, `eventArn` |
+| Inverted range | `startTime`, `endTime`, `eventArn` |
+| Tag over 200 characters | tag key, character count |
+| Submission attempted | metric name, value, `eventArn` |
+
+The full event payload is never logged. Only the fields listed above are written.
 
 ## Repository layout
 
@@ -217,16 +257,15 @@ internal/forwarder/
 .goreleaser.yaml               packaging: one linux/amd64 zip with bootstrap at the root
 ```
 
-`main.go` holds no behaviour: everything lives in `internal/forwarder`, which keeps the
-package importable only from inside this module. `duration.go`, `tags.go`, and `evaluate.go`
-are pure — arguments in, values out, no I/O and no package state. `handler.go` is the only
-file that performs side effects, and `submitMetric` is the only submission point.
+`main.go` holds no behaviour: everything lives in `internal/forwarder`, which keeps the package
+importable only from inside this module. `duration.go`, `tags.go`, and `evaluate.go` are pure —
+arguments in, values out, no I/O and no package state. `handler.go` is the only file that
+performs side effects, and `submitMetric` is the only submission point.
 
-Go requires test files to sit in the same directory as the package they test, so the
-`*_test.go` files live in `internal/forwarder` alongside the code. They are not part of the
-build: `go build` and GoReleaser ignore `*_test.go` entirely, so the release archive contains
-only the `bootstrap` binary, and the test-only `pgregory.net/rapid` dependency is never linked
-in.
+Go requires test files to sit in the same directory as the package they test, so the `*_test.go`
+files live in `internal/forwarder` alongside the code. They are not part of the build: `go
+build` and GoReleaser ignore `*_test.go` entirely, so the release archive contains only the
+`bootstrap` binary, and the test-only `pgregory.net/rapid` dependency is never linked in.
 
 ## Build, test, release
 
@@ -237,25 +276,28 @@ go build ./...
 # Run the test suite (unit, example, property-based, and source-hygiene tests)
 go test ./...
 
-# Produce the Release_Bundle
+# Produce the deployment artifact
 goreleaser release --snapshot --clean
 ```
 
-GoReleaser writes the deployment artifact to the repository `dist` directory:
+GoReleaser writes the artifact to the repository `dist` directory:
 
 ```
 dist/aws-health-event-forwarder.zip
 ```
 
-The archive holds exactly one entry, `bootstrap`, at the archive root with the owner-execute
-bit set. `bootstrap` is the entry point name required by the `provided.al2` and
-`provided.al2023` custom runtimes; no runtime shim is needed because `lambda.Start` from
-`aws-lambda-go` speaks the custom runtime API directly. The build targets `linux/amd64` only,
-which is why exactly one zip is produced. `goreleaser check` validates the configuration
-without building.
+The archive holds exactly one entry, `bootstrap`, at the archive root with the owner-execute bit
+set. `bootstrap` is the entry point name required by the `provided.al2` and `provided.al2023`
+custom runtimes; no runtime shim is needed because `lambda.Start` from `aws-lambda-go` speaks
+the custom runtime API directly. The build targets `linux/amd64` only, which is why exactly one
+zip is produced.
 
-Datadog authentication and client configuration come from the Datadog Lambda layer. The
-source contains no Datadog API key, site, or metrics endpoint value, and no code path that
+`goreleaser check` validates the configuration without building. Note that it is a schema check
+only — an invalid archive format, for instance, surfaces only during an actual release run, so
+it is not a substitute for a snapshot build.
+
+Datadog authentication and client configuration come from the Datadog Lambda layer. This
+repository contains no Datadog API key, site, or metrics endpoint value, and no code path that
 reads them from configuration or the environment.
 
 ## Metric type rationale
@@ -268,34 +310,11 @@ Submitting a gauge or a count instead would require one of:
 
 - the DogStatsD endpoint on `127.0.0.1:8125`, which means adding the Datadog extension layer
   and a StatsD client, or
-- direct calls to the Datadog HTTP API, which means handling a Datadog API key in code — which
-  this function is explicitly not allowed to do.
+- direct calls to the Datadog HTTP API, which means handling a Datadog API key in code.
 
-Distribution is also the right type for this data: it preserves every individual sample within
-a rollup window, which is exactly what makes the query-time `max ... by {arn}` dedup work. A
-gauge would collapse duplicates unpredictably by last-write-wins.
-
-## Migration notes
-
-Metrics removed by this change:
-
-| Removed metric | Replacement |
-| --- | --- |
-| `aws.health.issue.received` | Native integration Datadog Events (identity, counts) |
-| `aws.health.issue.alert_status` | Native integration Datadog Events (lifecycle) |
-| `aws.health.issue.duration_seconds` | `aws.health.events.duration` |
-
-Tag change: the previous `event_arn` tag key is replaced by the `arn` tag key, and its value is
-now the full, untrimmed ARN. The ARN identity is carried under `arn` only — no alias tag key
-carries the same value, even if another pipeline component still references `event_arn`. The
-`event_scope_code`, `status_code`, and `event_type_category` tag keys are no longer emitted on
-any sample.
-
-Because the metric name changed, the new series starts with no history, which is intentional:
-`aws.health.issue.duration_seconds` history is inflated by duplicate deliveries and is not
-worth carrying forward. Dashboards and monitors referencing the old metric names or the
-`event_arn` tag key must be updated to the new name, the `arn` tag key, and the dedup query
-pattern.
+Distribution is also the right type for this data: it preserves every individual sample within a
+rollup window, which is exactly what makes the query-time `max ... by {arn}` dedup work. A gauge
+would collapse duplicates unpredictably by last-write-wins.
 
 ## Dependencies
 
@@ -306,11 +325,10 @@ pattern.
 | `pgregory.net/rapid` (test only) | `v1.3.0` |
 | `go` directive | `1.25.3` |
 
-Both direct runtime dependencies are at the highest stable released version inside their
-existing major version (`v2` and `v1` respectively). Pre-release versions such as
-`v2.10.0-rc.*` and `v2.11.0-dev` are excluded, since a stable release is a published semantic
-version with no pre-release suffix and no pseudo-version form. Nothing was raised at the last
-dependency re-check, and no version was rejected on build or test grounds.
+Both runtime dependencies are at the highest stable released version inside their existing major
+version (`v2` and `v1` respectively). Pre-release versions such as `v2.10.0-rc.*` and
+`v2.11.0-dev` are excluded, since a stable release is a published semantic version with no
+pre-release suffix and no pseudo-version form.
 
-`pgregory.net/rapid` is a test-only dependency used for the property-based test suite; it is
-not linked into the Lambda binary.
+`pgregory.net/rapid` is a test-only dependency used by the property-based test suite; it is not
+linked into the Lambda binary.

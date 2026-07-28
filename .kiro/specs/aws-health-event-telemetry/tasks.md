@@ -186,7 +186,7 @@ File layout produced by this plan:
     - Confirm that a deliberately invalid configuration or compile failure exits non-zero with an identifying message and writes no zip (verify by inspection of the failing run, then restore the working configuration)
     - _Requirements: 6.2, 6.3, 6.4, 6.5, 6.6_
 
-- [x] 10. Verify dependencies and module integrity
+- [x] 10. Verify dependencies and module integrityr
   - [x] 10.1 Re-check dependency versions and run the full module checks
     - Run `go list -m -versions` for `github.com/DataDog/dd-trace-go/contrib/aws/datadog-lambda-go/v2` and `github.com/aws/aws-lambda-go`; identify the highest version with no pre-release suffix and no pseudo-version form inside the existing major (`v2` and `v1`)
     - Raise the declared version only if a newer stable version has appeared; otherwise keep `v2.9.1` and `v1.54.0`, and keep the `go` directive at no lower than `1.25.3`
